@@ -169,11 +169,14 @@ def main():
     msg["To"] = os.environ["MAIL_TO"]
     msg.attach(MIMEText(html, "html", "utf-8"))
 
-    with smtplib.SMTP(os.environ["SMTP_HOST"], 587) as server:
-        server.starttls()
-        server.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
-        server.send_message(msg)
+   SMTP_HOST = os.environ["SMTP_HOST"]
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+SMTP_USER = os.environ["SMTP_USER"]
+SMTP_PASS = os.environ["SMTP_PASS"]
 
+with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+    server.login(SMTP_USER, SMTP_PASS)
+    server.send_message(msg)
     st["seen"] = list(seen)[-4000:]
     save_state(st)
 
