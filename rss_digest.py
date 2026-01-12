@@ -88,9 +88,11 @@ HEADERS = {
 }
 
 # =========================
-# Biztoc 링크 -> "진짜 원문 링크" 강제 변환(강화판)
-# - Biztoc 페이지는 원문 URL이 <a href>에 없고 script/json에 숨어있는 경우가 많아
-#   HTML 전체에서 URL을 스캔해서 원문을 뽑음.
+# Biztoc 링크 -> "진짜 원문 링크" 강제 변환(최강 버전)
+# 핵심 포인트:
+#  - Biztoc은 Actions에서 403/429가 잦아서 원문 추출 실패 -> biztoc 링크가 그대로 메일에 남음
+#  - 해결: 1차로 biztoc 직접 시도, 막히면 2차로 https://r.jina.ai/ 프록시를 통해 HTML을 읽어
+#          원문 URL을 뽑음.
 # =========================
 def extract_source_link_if_biztoc(url: str) -> str:
     if not url or "biztoc.com" not in url:
@@ -103,81 +105,60 @@ def extract_source_link_if_biztoc(url: str) -> str:
         "gist.ai", "gista.ai",
         "accounts.google.com",
     )
+
+    # 원문같은 링크 우선 선택(키워드/도메인 힌트)
     prefer_keywords = (
         "/news", "/tech", "/world", "/business", "/markets", "/article", "/stories", "/story",
-        "rcna", "reuters", "cnbc", "bloomberg", "wsj", "ft.com", "nytimes", "washingtonpost",
+        "reuters", "cnbc", "bloomberg", "wsj", "ft.com", "nytimes", "washingtonpost",
         "nbcnews", "apnews", "theverge", "axios", "economist", "coindesk", "cointelegraph"
     )
 
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
-        r.raise_for_status()
-        html = r.text
-
-        # 1) meta/canonical에서 먼저 찾기(있으면 가장 깔끔)
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            meta_candidates = []
-            tag = soup.select_one('meta[property="og:url"]')
-            if tag and (tag.get("content") or "").strip().startswith("http"):
-                meta_candidates.append(tag.get("content").strip())
-            tag = soup.select_one('meta[name="twitter:url"]')
-            if tag and (tag.get("content") or "").strip().startswith("http"):
-                meta_candidates.append(tag.get("content").strip())
-            tag = soup.select_one('link[rel="canonical"]')
-            if tag and (tag.get("href") or "").strip().startswith("http"):
-                meta_candidates.append(tag.get("href").strip())
-
-            for v in meta_candidates:
-                if "biztoc.com" not in v:
-                    return v
-        except Exception:
-            pass
-
-        # 2) raw HTML에서 모든 URL 후보 추출 (script/json 포함)
-        candidates = re.findall(r"https?://[^\s\"'<>]+", html)
-
+    def pick_best_from_text(text: str) -> Optional[str]:
+        # text(HTML/script/json 포함)에서 URL 전부 뽑아서 “biztoc 아닌 것” 고름
+        urls = re.findall(r"https?://[^\s\"'<>]+", text or "")
         clean: List[str] = []
-        for c in candidates:
-            c = c.strip().rstrip(").,;\"'")  # 끝문자 정리
-            if len(c) < 12:
-                continue
-            # host 추출
+        for u in urls:
+            u = u.strip().rstrip(").,;\"'")
             try:
-                host = c.split("/")[2].lower()
+                host = u.split("/")[2].lower()
             except Exception:
-                host = ""
+                continue
             if any(b in host for b in bad_hosts):
                 continue
-            clean.append(c)
+            clean.append(u)
 
-        # 3) 뉴스 원문처럼 보이는 링크 우선 반환
-        for c in clean:
-            lc = c.lower()
-            if any(k in lc for k in prefer_keywords):
-                return c
+        # 뉴스 원문 같은 키워드 우선
+        for u in clean:
+            lu = u.lower()
+            if any(k in lu for k in prefer_keywords):
+                return u
 
-        # 4) 그래도 없으면 첫 번째 유효 후보
-        if clean:
-            return clean[0]
+        return clean[0] if clean else None
 
-        # 5) 마지막으로 anchor도 훑기(혹시 있을 수 있음)
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            for a in soup.find_all("a", href=True):
-                href = (a.get("href") or "").strip()
-                if not href.startswith("http"):
-                    continue
-                host = href.split("/")[2].lower()
-                if not any(b in host for b in bad_hosts):
-                    return href
-        except Exception:
-            pass
-
-        return url
-
+    # 1차: biztoc 직접 접근 (될 때는 가장 빠름)
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        # 403/429/5xx면 아래 프록시로 넘어감
+        if r.status_code < 400:
+            best = pick_best_from_text(r.text)
+            if best:
+                return best
     except Exception:
-        return url
+        pass
+
+    # 2차(핵심): r.jina.ai 프록시로 읽어서 원문 링크 추출 (403/429 우회)
+    try:
+        reader_url = "https://r.jina.ai/" + url
+        rr = requests.get(reader_url, headers=HEADERS, timeout=20, allow_redirects=True)
+        rr.raise_for_status()
+        best = pick_best_from_text(rr.text)
+        if best:
+            return best
+    except Exception:
+        pass
+
+    # 실패 시 원래 링크(최후)
+    return url
 
 
 # =========================
@@ -391,7 +372,7 @@ def fetch_rss_new_items(state: Dict, category: str, urls: List[str]) -> List[Dic
             link = (e.get("link") or "").strip()
             summary = (e.get("summary") or e.get("description") or "").strip()
 
-            # ✅ Biztoc이면 "진짜 원문 링크"로 교체
+            # ✅ Biztoc이면 "진짜 원문 링크"로 교체(프록시 우회 포함)
             link = extract_source_link_if_biztoc(link)
 
             sid = stable_id(f"{category}|{title}|{link}")
@@ -558,7 +539,6 @@ def build_holdings_html(holdings_news: List[Dict]) -> str:
     for it in holdings_news[:40]:
         t = html_escape(it.get("title", ""))
         link = it.get("link", "#")
-        # ✅ target="_blank" 로 새 탭 열기(되튕김 방지)
         parts.append(f'<div class="card"><div class="title"><a href="{link}" target="_blank" rel="noopener noreferrer">{t}</a></div></div>')
 
     parts.append("</div>")
@@ -569,7 +549,6 @@ def build_holdings_html(holdings_news: List[Dict]) -> str:
 # Email Send (Hanmail/Daum SMTP Submission)
 # =========================
 def send_email(subject: str, html_body: str) -> None:
-    # ✅ 한메일 로그인 제출 방식 (MX 직송 금지)
     SMTP_HOST = "smtp.daum.net"
     SMTP_PORT = 465
 
@@ -641,13 +620,11 @@ def main():
     save_state(state)
 
     # 6) 발송
-    # (A) 보유종목 전용 즉시 메일
     if send_holdings:
         html_h = build_holdings_html(holdings_news)
         send_email("[보유종목 즉시] 뉴스", html_h)
         mark_sent(state, "HOLDINGS")
 
-    # (B) 시장 레이더 메일 (내용이 하나라도 있을 때만)
     has_market_any = any([
         market_alerts_kospi, market_alerts_kosdaq,
         market_spikes_kospi, market_spikes_kosdaq,
@@ -683,7 +660,6 @@ def main():
         if send_dart: mark_sent(state, "DART")
         if send_spikes: mark_sent(state, "SPIKES")
 
-    # 마지막으로 last_sent 갱신 저장
     save_state(state)
     print("Done.")
 
