@@ -485,20 +485,27 @@ def build_holdings_html(holdings_news: List[Dict]) -> str:
 
 
 def send_email(subject: str, html_body: str) -> None:
-    host = os.environ["SMTP_HOST"]
-    port = int(os.environ.get("SMTP_PORT", 465))
+    SMTP_HOST = "smtp.daum.net"
+    SMTP_PORT = 465
     user = os.environ["SMTP_USER"]
     pwd = os.environ["SMTP_PASS"]
     mail_to = os.environ.get("MAIL_TO", user)
 
-    msg = EmailMessage()
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = user
     msg["To"] = mail_to
-    msg.set_content(html_body, subtype="html")
+
+    # Plain + HTML 같이 보내야 스팸 차단 안 됨
+    plain = "자동 뉴스 요약 메일입니다.\n(HTML이 보이지 않으면 웹버전을 확인해주세요)"
+    msg.attach(MIMEText(plain, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL(host, port, context=ctx, timeout=30) as server:
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=30) as server:
         server.login(user, pwd)
         server.send_message(msg)
 
