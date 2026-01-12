@@ -14,6 +14,9 @@ from bs4 import BeautifulSoup
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+# =========================
+# Config / State
+# =========================
 STATE_DIR = Path(".state")
 STATE_FILE = STATE_DIR / "state.json"
 
@@ -21,25 +24,25 @@ STATE_FILE = STATE_DIR / "state.json"
 KOSPI_ALERT_PCT = 8.0
 KOSDAQ_ALERT_PCT = 8.0
 
-# 🔥 폭증을 ‘진짜 세력 시동급’만 잡도록 강화
-VOLUME_SPIKE_RATIO = 5.0      # 거래량 5배 이상
-VALUE_SPIKE_RATIO = 5.0       # 거래대금 5배 이상
+# 폭증 기준
+VOLUME_SPIKE_RATIO = 5.0
+VALUE_SPIKE_RATIO = 5.0
 
-# 🔥 최소 거래대금 필터 (잡주 제거용)
-MIN_VALUE_ABS = 50000         # 표기 단위 기준 5만 이상만
+# 최소 거래대금 필터
+MIN_VALUE_ABS = 50000
 
-# 뉴스 폭주 방지: 미국/한국경제는 묶음(쿨다운)
-COOLDOWN_US_SEC = 1800            # 30분
-COOLDOWN_KR_SEC = 1800            # 30분
-COOLDOWN_CRYPTO_SEC = 900         # 15분
-
-# 보유/공시/급등/폭증은 즉시(쿨다운 0)
+# 쿨다운(초)
+COOLDOWN_US_SEC = 1800
+COOLDOWN_KR_SEC = 1800
+COOLDOWN_CRYPTO_SEC = 900
 COOLDOWN_HOLDINGS_SEC = 0
 COOLDOWN_DART_SEC = 0
 COOLDOWN_SPIKES_SEC = 0
 
+HEADERS = {"User-Agent": "Mozilla/5.0 (rss-mailer; GitHub Actions)"}
+
 # =========================
-# 데이터 소스
+# Data Sources
 # =========================
 NAVER_KOSPI_RISE = "https://finance.naver.com/sise/sise_rise.nhn?sosok=0"
 NAVER_KOSDAQ_RISE = "https://finance.naver.com/sise/sise_rise.nhn?sosok=1"
@@ -83,86 +86,74 @@ KOREA_POLICY_KEYWORDS = [
     "환율", "원달러", "수출", "물가", "CPI",
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (rss-mailer; GitHub Actions)",
-}
+# =========================
+# Biztoc resolver
+# - 기본 링크는 "안정뷰"로 강제( Biztoc 되돌아감 차단 )
+# - 원문 추출되면 "원문" 버튼으로 함께 제공
+# =========================
+_BAD_HOSTS = (
+    "biztoc.com",
+    "twitter.com", "x.com", "facebook.com", "t.me", "telegram.me",
+    "reddit.com", "youtube.com", "youtu.be", "linkedin.com",
+    "gist.ai", "gista.ai",
+    "accounts.google.com",
+)
 
-# =========================
-# Biztoc 링크 -> "진짜 원문 링크" 강제 변환(최강 버전)
-# 핵심 포인트:
-#  - Biztoc은 Actions에서 403/429가 잦아서 원문 추출 실패 -> biztoc 링크가 그대로 메일에 남음
-#  - 해결: 1차로 biztoc 직접 시도, 막히면 2차로 https://r.jina.ai/ 프록시를 통해 HTML을 읽어
-#          원문 URL을 뽑음.
-# =========================
-def extract_source_link_if_biztoc(url: str) -> str:
+_PREFER_KEYWORDS = (
+    "/news", "/tech", "/world", "/business", "/markets", "/article", "/stories", "/story",
+    "reuters", "cnbc", "bloomberg", "wsj", "ft.com", "nytimes", "washingtonpost",
+    "nbcnews", "apnews", "theverge", "axios", "economist", "coindesk", "cointelegraph",
+)
+
+def _pick_best_source_url_from_text(text: str) -> Optional[str]:
+    urls = re.findall(r"https?://[^\s\"'<>]+", text or "")
+    clean: List[str] = []
+    for u in urls:
+        u = u.strip().rstrip(").,;\"'")
+        try:
+            host = u.split("/")[2].lower()
+        except Exception:
+            continue
+        if any(b in host for b in _BAD_HOSTS):
+            continue
+        clean.append(u)
+
+    for u in clean:
+        lu = u.lower()
+        if any(k in lu for k in _PREFER_KEYWORDS):
+            return u
+
+    return clean[0] if clean else None
+
+def resolve_biztoc(url: str) -> Tuple[str, Optional[str]]:
     if not url or "biztoc.com" not in url:
-        return url
+        return url, None
 
-    bad_hosts = (
-        "biztoc.com",
-        "twitter.com", "x.com", "facebook.com", "t.me", "telegram.me",
-        "reddit.com", "youtube.com", "youtu.be", "linkedin.com",
-        "gist.ai", "gista.ai",
-        "accounts.google.com",
-    )
+    # ✅ 절대 튕기지 않는 기본 링크(Reader)
+    safe_link = "https://r.jina.ai/" + url
+    source_link: Optional[str] = None
 
-    # 원문같은 링크 우선 선택(키워드/도메인 힌트)
-    prefer_keywords = (
-        "/news", "/tech", "/world", "/business", "/markets", "/article", "/stories", "/story",
-        "reuters", "cnbc", "bloomberg", "wsj", "ft.com", "nytimes", "washingtonpost",
-        "nbcnews", "apnews", "theverge", "axios", "economist", "coindesk", "cointelegraph"
-    )
-
-    def pick_best_from_text(text: str) -> Optional[str]:
-        # text(HTML/script/json 포함)에서 URL 전부 뽑아서 “biztoc 아닌 것” 고름
-        urls = re.findall(r"https?://[^\s\"'<>]+", text or "")
-        clean: List[str] = []
-        for u in urls:
-            u = u.strip().rstrip(").,;\"'")
-            try:
-                host = u.split("/")[2].lower()
-            except Exception:
-                continue
-            if any(b in host for b in bad_hosts):
-                continue
-            clean.append(u)
-
-        # 뉴스 원문 같은 키워드 우선
-        for u in clean:
-            lu = u.lower()
-            if any(k in lu for k in prefer_keywords):
-                return u
-
-        return clean[0] if clean else None
-
-    # 1차: biztoc 직접 접근 (될 때는 가장 빠름)
+    # 1) biztoc 직접 접근 시도(성공하면 원문 추출)
     try:
         r = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
-        # 403/429/5xx면 아래 프록시로 넘어감
         if r.status_code < 400:
-            best = pick_best_from_text(r.text)
-            if best:
-                return best
+            source_link = _pick_best_source_url_from_text(r.text)
     except Exception:
         pass
 
-    # 2차(핵심): r.jina.ai 프록시로 읽어서 원문 링크 추출 (403/429 우회)
-    try:
-        reader_url = "https://r.jina.ai/" + url
-        rr = requests.get(reader_url, headers=HEADERS, timeout=20, allow_redirects=True)
-        rr.raise_for_status()
-        best = pick_best_from_text(rr.text)
-        if best:
-            return best
-    except Exception:
-        pass
+    # 2) 막히면 reader에서 원문 추출 시도
+    if not source_link:
+        try:
+            rr = requests.get(safe_link, headers=HEADERS, timeout=20, allow_redirects=True)
+            if rr.status_code < 400:
+                source_link = _pick_best_source_url_from_text(rr.text)
+        except Exception:
+            pass
 
-    # 실패 시 원래 링크(최후)
-    return url
-
+    return safe_link, source_link
 
 # =========================
-# State
+# State helpers
 # =========================
 def load_state() -> Dict:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -170,8 +161,8 @@ def load_state() -> Dict:
         return {
             "seen_items": {},
             "last_risers": {"KOSPI": {}, "KOSDAQ": {}},
-            "last_metrics": {"KOSPI": {}, "KOSDAQ": {}},  # code -> {"vol": int, "val": int}
-            "last_sent": {},  # bucket -> epoch
+            "last_metrics": {"KOSPI": {}, "KOSDAQ": {}},
+            "last_sent": {},
         }
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -183,11 +174,9 @@ def load_state() -> Dict:
             "last_sent": {},
         }
 
-
 def save_state(state: Dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
 
 # =========================
 # Utils
@@ -195,10 +184,8 @@ def save_state(state: Dict) -> None:
 def stable_id(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
 
-
 def html_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
 
 def parse_int(s: str) -> int:
     s = (s or "").replace(",", "").strip()
@@ -207,10 +194,8 @@ def parse_int(s: str) -> int:
     out = "".join(ch for ch in s if ch.isdigit())
     return int(out) if out else 0
 
-
 def now_epoch() -> int:
     return int(time.time())
-
 
 def cooldown_ok(state: Dict, bucket: str, cooldown_sec: int) -> bool:
     if cooldown_sec <= 0:
@@ -218,20 +203,14 @@ def cooldown_ok(state: Dict, bucket: str, cooldown_sec: int) -> bool:
     last = int(state.get("last_sent", {}).get(bucket, 0))
     return (now_epoch() - last) >= cooldown_sec
 
-
 def mark_sent(state: Dict, bucket: str) -> None:
     state.setdefault("last_sent", {})
     state["last_sent"][bucket] = now_epoch()
 
-
 # =========================
-# Naver Rise Scrape (pct + volume + value)
+# Naver rise scrape
 # =========================
 def fetch_risers(url: str, top_n: int = 30) -> List[Dict]:
-    """
-    네이버 상승 페이지에서 TOP N 종목 추출
-    반환: [{code, name, pct, price, vol, val, link}]
-    """
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -252,14 +231,11 @@ def fetch_risers(url: str, top_n: int = 30) -> List[Dict]:
 
         name = a.get_text(strip=True)
         href = a.get("href", "")
-        code = ""
-        if "code=" in href:
-            code = href.split("code=")[-1].strip()
+        code = href.split("code=")[-1].strip() if "code=" in href else ""
 
         price = tds[1].get_text(strip=True)
 
-        pct_text = tds[4].get_text(strip=True)
-        pct_text = pct_text.replace("%", "").replace("+", "").replace(",", "").strip()
+        pct_text = tds[4].get_text(strip=True).replace("%", "").replace("+", "").replace(",", "").strip()
         try:
             pct = float(pct_text)
         except Exception:
@@ -275,7 +251,6 @@ def fetch_risers(url: str, top_n: int = 30) -> List[Dict]:
 
     return results
 
-
 def detect_price_alerts_and_spikes(state: Dict) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
     alerts_kospi: List[Dict] = []
     alerts_kosdaq: List[Dict] = []
@@ -284,46 +259,38 @@ def detect_price_alerts_and_spikes(state: Dict) -> Tuple[List[Dict], List[Dict],
 
     last_kospi_pct = state.get("last_risers", {}).get("KOSPI", {})
     last_kosdaq_pct = state.get("last_risers", {}).get("KOSDAQ", {})
-
     last_kospi_m = state.get("last_metrics", {}).get("KOSPI", {})
     last_kosdaq_m = state.get("last_metrics", {}).get("KOSDAQ", {})
 
     kospi_now = fetch_risers(NAVER_KOSPI_RISE, top_n=30)
     kosdaq_now = fetch_risers(NAVER_KOSDAQ_RISE, top_n=30)
 
-    new_last_kospi_pct = {}
-    new_last_kosdaq_pct = {}
-    new_last_kospi_m = {}
-    new_last_kosdaq_m = {}
+    new_last_kospi_pct, new_last_kosdaq_pct = {}, {}
+    new_last_kospi_m, new_last_kosdaq_m = {}, {}
 
-    # --- KOSPI ---
     for it in kospi_now:
         key = it["code"] or it["name"]
         new_last_kospi_pct[key] = it["pct"]
         new_last_kospi_m[key] = {"vol": it["vol"], "val": it["val"]}
 
-        # 가격 급등(+8%)
         if it["pct"] >= KOSPI_ALERT_PCT:
             prev = float(last_kospi_pct.get(key, -999))
             if (key not in last_kospi_pct) or (it["pct"] - prev >= 0.5):
                 alerts_kospi.append(it)
 
-        # 거래량/대금 폭증
         prev_m = last_kospi_m.get(key, {"vol": 0, "val": 0})
         pv, pval = int(prev_m.get("vol", 0)), int(prev_m.get("val", 0))
         vol_ratio = (it["vol"] / pv) if pv > 0 else 0.0
         val_ratio = (it["val"] / pval) if pval > 0 else 0.0
 
-        abs_ok = True if MIN_VALUE_ABS is None else (it["val"] >= int(MIN_VALUE_ABS))
+        abs_ok = it["val"] >= int(MIN_VALUE_ABS)
         if abs_ok and ((pv > 0 and vol_ratio >= VOLUME_SPIKE_RATIO) or (pval > 0 and val_ratio >= VALUE_SPIKE_RATIO)):
-            # 잡음 방지: 최소 +5% 이상일 때만 폭증 알림
             if it["pct"] >= 5.0:
                 it2 = dict(it)
                 it2["vol_ratio"] = vol_ratio
                 it2["val_ratio"] = val_ratio
                 spikes_kospi.append(it2)
 
-    # --- KOSDAQ ---
     for it in kosdaq_now:
         key = it["code"] or it["name"]
         new_last_kosdaq_pct[key] = it["pct"]
@@ -339,7 +306,7 @@ def detect_price_alerts_and_spikes(state: Dict) -> Tuple[List[Dict], List[Dict],
         vol_ratio = (it["vol"] / pv) if pv > 0 else 0.0
         val_ratio = (it["val"] / pval) if pval > 0 else 0.0
 
-        abs_ok = True if MIN_VALUE_ABS is None else (it["val"] >= int(MIN_VALUE_ABS))
+        abs_ok = it["val"] >= int(MIN_VALUE_ABS)
         if abs_ok and ((pv > 0 and vol_ratio >= VOLUME_SPIKE_RATIO) or (pval > 0 and val_ratio >= VALUE_SPIKE_RATIO)):
             if it["pct"] >= 1.0:
                 it2 = dict(it)
@@ -356,9 +323,8 @@ def detect_price_alerts_and_spikes(state: Dict) -> Tuple[List[Dict], List[Dict],
 
     return alerts_kospi, alerts_kosdaq, spikes_kospi, spikes_kosdaq
 
-
 # =========================
-# RSS fetch "new only"
+# RSS fetch (new-only)
 # =========================
 def fetch_rss_new_items(state: Dict, category: str, urls: List[str]) -> List[Dict]:
     seen_list = state.get("seen_items", {}).get(category, [])
@@ -372,20 +338,27 @@ def fetch_rss_new_items(state: Dict, category: str, urls: List[str]) -> List[Dic
             link = (e.get("link") or "").strip()
             summary = (e.get("summary") or e.get("description") or "").strip()
 
-            # ✅ Biztoc이면 "진짜 원문 링크"로 교체(프록시 우회 포함)
-            link = extract_source_link_if_biztoc(link)
+            safe_link = link
+            source_link = None
+            if "biztoc.com" in (link or ""):
+                safe_link, source_link = resolve_biztoc(link)
 
-            sid = stable_id(f"{category}|{title}|{link}")
+            sid = stable_id(f"{category}|{title}|{safe_link}")
             if sid in seen:
                 continue
 
-            new_items.append({"title": title, "link": link, "summary": summary, "source": u})
+            new_items.append({
+                "title": title,
+                "link": safe_link,          # ✅ 기본 클릭: 안정뷰(절대 튕김 없음)
+                "source_link": source_link, # ✅ 원문(있으면 버튼)
+                "summary": summary,
+                "source": u
+            })
             seen.add(sid)
 
     state.setdefault("seen_items", {})
     state["seen_items"][category] = list(seen)[-4000:]
     return new_items
-
 
 def filter_holdings_news(items: List[Dict]) -> List[Dict]:
     out: List[Dict] = []
@@ -395,64 +368,44 @@ def filter_holdings_news(items: List[Dict]) -> List[Dict]:
             out.append(it)
     return out
 
-
 def mark_policy_priority(items: List[Dict]) -> List[Dict]:
     for it in items:
         text = f'{it.get("title","")} {it.get("summary","")}'
         it["priority"] = any(k in text for k in KOREA_POLICY_KEYWORDS)
     return items
 
-
 # =========================
-# 기관/외국인 수급 힌트
-# =========================
-def try_fetch_investor_hint(code: str) -> Optional[str]:
-    if not code or not code.isdigit():
-        return None
-    try:
-        url = f"https://finance.naver.com/item/frgn.nhn?code={code}"
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        text = soup.get_text(" ", strip=True)
-
-        hints = []
-        if "외국인" in text:
-            hints.append("외국인")
-        if "기관" in text:
-            hints.append("기관")
-        if not hints:
-            return None
-        return "수급: " + "/".join(hints) + " (네이버)"
-    except Exception:
-        return None
-
-
-# =========================
-# Email (mobile card style)
+# HTML builders
 # =========================
 def build_html_cards(title: str, items: List[Dict], badge_fn=None, max_n: int = 30) -> str:
     cards = []
     for it in items[:max_n]:
         t = html_escape(it.get("title") or it.get("name") or "")
         link = it.get("link") or "#"
-        badge = ""
-        if badge_fn:
-            badge = badge_fn(it) or ""
+        source_link = it.get("source_link")
+        badge = badge_fn(it) if badge_fn else ""
 
-        # ✅ target="_blank" 로 새 탭 열기(되튕김 방지)
+        btns = ""
+        if source_link:
+            btns = f"""
+              <div class="btnrow">
+                <a class="btn" href="{source_link}" target="_blank" rel="noopener noreferrer">원문</a>
+                <a class="btn ghost" href="{link}" target="_blank" rel="noopener noreferrer">안정뷰</a>
+              </div>
+            """
+
         cards.append(f"""
         <div class="card">
           <div class="row">
             <div class="title"><a href="{link}" target="_blank" rel="noopener noreferrer">{t}</a></div>
-            {badge}
+            {badge or ""}
           </div>
+          {btns}
         </div>
         """)
     if not cards:
         return ""
     return f"<h3>{html_escape(title)}</h3>" + "\n".join(cards)
-
 
 def build_market_html(
     alerts_kospi: List[Dict],
@@ -477,6 +430,9 @@ def build_market_html(
       .pill { display: inline-block; padding: 4px 8px; border-radius: 999px; background: #f4f4f4; font-size: 12px; white-space: nowrap; }
       .pill.hot { background: #ffe9e9; }
       .pill.warn { background: #fff5d6; }
+      .btnrow { margin-top: 10px; display: flex; gap: 8px; }
+      .btn { display:inline-block; padding: 8px 10px; border-radius: 10px; border: 1px solid #111; color:#111; text-decoration:none; font-weight:700; font-size:12px; }
+      .btn.ghost { border-color:#ddd; color:#555; }
     </style>
     """
 
@@ -492,19 +448,14 @@ def build_market_html(
     parts.append('<div class="hdr">📡 수시 레이더 (시장/공시/뉴스/코인)</div>')
     parts.append(f'<div class="sub">생성: {time.strftime("%Y-%m-%d %H:%M:%S")}</div>')
 
-    # 급등
     if alerts_kospi:
         parts.append(build_html_cards("📈 코스피 +8% 급등", alerts_kospi, badge_fn=badge_price, max_n=30))
     if alerts_kosdaq:
         parts.append(build_html_cards("🚀 코스닥 +8% 급등", alerts_kosdaq, badge_fn=badge_price, max_n=30))
-
-    # 폭증
     if spikes_kospi:
         parts.append(build_html_cards("📊 코스피 거래량/대금 폭증", spikes_kospi, badge_fn=badge_spike, max_n=30))
     if spikes_kosdaq:
         parts.append(build_html_cards("📊 코스닥 거래량/대금 폭증", spikes_kosdaq, badge_fn=badge_spike, max_n=30))
-
-    # 공시/미국/코인/한국경제
     if dart_items:
         parts.append(build_html_cards("📌 공시(DART) 신규", dart_items, max_n=30))
     if us_items:
@@ -519,7 +470,6 @@ def build_market_html(
     parts.append("</div>")
     return "\n".join([p for p in parts if p])
 
-
 def build_holdings_html(holdings_news: List[Dict]) -> str:
     style = """
     <style>
@@ -530,6 +480,9 @@ def build_holdings_html(holdings_news: List[Dict]) -> str:
       .card { border: 1px solid #eaeaea; border-radius: 14px; padding: 12px; margin: 10px 0; }
       .title { font-size: 14px; font-weight: 700; line-height: 1.35; }
       .title a { text-decoration: none; color: #111; }
+      .btnrow { margin-top: 10px; display: flex; gap: 8px; }
+      .btn { display:inline-block; padding: 8px 10px; border-radius: 10px; border: 1px solid #111; color:#111; text-decoration:none; font-weight:700; font-size:12px; }
+      .btn.ghost { border-color:#ddd; color:#555; }
     </style>
     """
     parts = [style, '<div class="wrap">']
@@ -539,14 +492,29 @@ def build_holdings_html(holdings_news: List[Dict]) -> str:
     for it in holdings_news[:40]:
         t = html_escape(it.get("title", ""))
         link = it.get("link", "#")
-        parts.append(f'<div class="card"><div class="title"><a href="{link}" target="_blank" rel="noopener noreferrer">{t}</a></div></div>')
+        source_link = it.get("source_link")
+
+        btns = ""
+        if source_link:
+            btns = f"""
+              <div class="btnrow">
+                <a class="btn" href="{source_link}" target="_blank" rel="noopener noreferrer">원문</a>
+                <a class="btn ghost" href="{link}" target="_blank" rel="noopener noreferrer">안정뷰</a>
+              </div>
+            """
+
+        parts.append(f"""
+        <div class="card">
+          <div class="title"><a href="{link}" target="_blank" rel="noopener noreferrer">{t}</a></div>
+          {btns}
+        </div>
+        """)
 
     parts.append("</div>")
     return "\n".join(parts)
 
-
 # =========================
-# Email Send (Hanmail/Daum SMTP Submission)
+# Email send (Hanmail/Daum)
 # =========================
 def send_email(subject: str, html_body: str) -> None:
     SMTP_HOST = "smtp.daum.net"
@@ -570,43 +538,29 @@ def send_email(subject: str, html_body: str) -> None:
         server.login(user, pwd)
         server.send_message(msg)
 
-
 # =========================
 # Main
 # =========================
 def main():
     state = load_state()
 
-    # 1) 급등 + 폭증 감지
     alerts_kospi, alerts_kosdaq, spikes_kospi, spikes_kosdaq = detect_price_alerts_and_spikes(state)
 
-    # 2) RSS 신규 수집
     us_all = fetch_rss_new_items(state, "US_MARKET", RSS_SOURCES["US_MARKET"])
     korea_all = fetch_rss_new_items(state, "KOREA_ECON_POLICY", RSS_SOURCES["KOREA_ECON_POLICY"])
     dart_all = fetch_rss_new_items(state, "DART", RSS_SOURCES["DART"])
     crypto_all = fetch_rss_new_items(state, "CRYPTO", RSS_SOURCES["CRYPTO"])
 
-    # 3) 보유 종목 뉴스 필터 + 한국 정책 강조
     holdings_news = filter_holdings_news(us_all + korea_all)
     korea_marked = mark_policy_priority(korea_all)
 
-    # 4) 기관/외국인 힌트(알림 종목에만, best-effort)
-    for it in (alerts_kospi + alerts_kosdaq + spikes_kospi + spikes_kosdaq)[:6]:
-        hint = try_fetch_investor_hint(it.get("code", ""))
-        if hint:
-            it["investor_hint"] = hint
-
-    # 5) 각 버킷별 발송 판단 + 쿨다운 적용
     send_holdings = bool(holdings_news) and cooldown_ok(state, "HOLDINGS", COOLDOWN_HOLDINGS_SEC)
-
     send_us = bool(us_all) and cooldown_ok(state, "US", COOLDOWN_US_SEC)
     send_kr = bool(korea_all) and cooldown_ok(state, "KR", COOLDOWN_KR_SEC)
     send_crypto = bool(crypto_all) and cooldown_ok(state, "CRYPTO", COOLDOWN_CRYPTO_SEC)
-
     send_dart = bool(dart_all) and cooldown_ok(state, "DART", COOLDOWN_DART_SEC)
     send_spikes = bool(alerts_kospi or alerts_kosdaq or spikes_kospi or spikes_kosdaq) and cooldown_ok(state, "SPIKES", COOLDOWN_SPIKES_SEC)
 
-    # 시장 메일에 포함할 항목(쿨다운 통과한 것만)
     market_us = us_all if send_us else []
     market_kr = korea_marked if send_kr else []
     market_crypto = crypto_all if send_crypto else []
@@ -616,10 +570,8 @@ def main():
     market_spikes_kospi = spikes_kospi if send_spikes else []
     market_spikes_kosdaq = spikes_kosdaq if send_spikes else []
 
-    # state 저장
     save_state(state)
 
-    # 6) 발송
     if send_holdings:
         html_h = build_holdings_html(holdings_news)
         send_email("[보유종목 즉시] 뉴스", html_h)
@@ -662,7 +614,6 @@ def main():
 
     save_state(state)
     print("Done.")
-
 
 if __name__ == "__main__":
     main()
