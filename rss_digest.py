@@ -17,7 +17,7 @@ from email.mime.text import MIMEText
 STATE_DIR = Path(".state")
 STATE_FILE = STATE_DIR / "state.json"
 
-# 급등 기준 (이미 OK)
+# 급등 기준
 KOSPI_ALERT_PCT = 8.0
 KOSDAQ_ALERT_PCT = 8.0
 
@@ -88,29 +88,94 @@ HEADERS = {
 }
 
 # =========================
-# Biztoc 링크 -> 원문 링크로 변환
+# Biztoc 링크 -> "진짜 원문 링크" 강제 변환(강화판)
+# - Biztoc 페이지는 원문 URL이 <a href>에 없고 script/json에 숨어있는 경우가 많아
+#   HTML 전체에서 URL을 스캔해서 원문을 뽑음.
 # =========================
 def extract_source_link_if_biztoc(url: str) -> str:
     if not url or "biztoc.com" not in url:
         return url
+
+    bad_hosts = (
+        "biztoc.com",
+        "twitter.com", "x.com", "facebook.com", "t.me", "telegram.me",
+        "reddit.com", "youtube.com", "youtu.be", "linkedin.com",
+        "gist.ai", "gista.ai",
+        "accounts.google.com",
+    )
+    prefer_keywords = (
+        "/news", "/tech", "/world", "/business", "/markets", "/article", "/stories", "/story",
+        "rcna", "reuters", "cnbc", "bloomberg", "wsj", "ft.com", "nytimes", "washingtonpost",
+        "nbcnews", "apnews", "theverge", "axios", "economist", "coindesk", "cointelegraph"
+    )
+
     try:
         r = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        html = r.text
 
-        # 페이지 내 외부(원문) 링크 후보를 우선 반환
-        for a in soup.find_all("a", href=True):
-            href = (a.get("href") or "").strip()
-            if href.startswith("http") and "biztoc.com" not in href:
-                return href
+        # 1) meta/canonical에서 먼저 찾기(있으면 가장 깔끔)
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            meta_candidates = []
+            tag = soup.select_one('meta[property="og:url"]')
+            if tag and (tag.get("content") or "").strip().startswith("http"):
+                meta_candidates.append(tag.get("content").strip())
+            tag = soup.select_one('meta[name="twitter:url"]')
+            if tag and (tag.get("content") or "").strip().startswith("http"):
+                meta_candidates.append(tag.get("content").strip())
+            tag = soup.select_one('link[rel="canonical"]')
+            if tag and (tag.get("href") or "").strip().startswith("http"):
+                meta_candidates.append(tag.get("href").strip())
 
-        # fallback: 텍스트에서 URL 하나라도 추출
-        text = soup.get_text(" ", strip=True)
-        m = re.search(r"https?://[^\s\"'>]+", text)
-        if m and "biztoc.com" not in m.group(0):
-            return m.group(0)
+            for v in meta_candidates:
+                if "biztoc.com" not in v:
+                    return v
+        except Exception:
+            pass
 
-        return r.url
+        # 2) raw HTML에서 모든 URL 후보 추출 (script/json 포함)
+        candidates = re.findall(r"https?://[^\s\"'<>]+", html)
+
+        clean: List[str] = []
+        for c in candidates:
+            c = c.strip().rstrip(").,;\"'")  # 끝문자 정리
+            if len(c) < 12:
+                continue
+            # host 추출
+            try:
+                host = c.split("/")[2].lower()
+            except Exception:
+                host = ""
+            if any(b in host for b in bad_hosts):
+                continue
+            clean.append(c)
+
+        # 3) 뉴스 원문처럼 보이는 링크 우선 반환
+        for c in clean:
+            lc = c.lower()
+            if any(k in lc for k in prefer_keywords):
+                return c
+
+        # 4) 그래도 없으면 첫 번째 유효 후보
+        if clean:
+            return clean[0]
+
+        # 5) 마지막으로 anchor도 훑기(혹시 있을 수 있음)
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = (a.get("href") or "").strip()
+                if not href.startswith("http"):
+                    continue
+                host = href.split("/")[2].lower()
+                if not any(b in host for b in bad_hosts):
+                    return href
+        except Exception:
+            pass
+
+        return url
+
     except Exception:
         return url
 
@@ -256,11 +321,13 @@ def detect_price_alerts_and_spikes(state: Dict) -> Tuple[List[Dict], List[Dict],
         new_last_kospi_pct[key] = it["pct"]
         new_last_kospi_m[key] = {"vol": it["vol"], "val": it["val"]}
 
+        # 가격 급등(+8%)
         if it["pct"] >= KOSPI_ALERT_PCT:
             prev = float(last_kospi_pct.get(key, -999))
             if (key not in last_kospi_pct) or (it["pct"] - prev >= 0.5):
                 alerts_kospi.append(it)
 
+        # 거래량/대금 폭증
         prev_m = last_kospi_m.get(key, {"vol": 0, "val": 0})
         pv, pval = int(prev_m.get("vol", 0)), int(prev_m.get("val", 0))
         vol_ratio = (it["vol"] / pv) if pv > 0 else 0.0
@@ -268,6 +335,7 @@ def detect_price_alerts_and_spikes(state: Dict) -> Tuple[List[Dict], List[Dict],
 
         abs_ok = True if MIN_VALUE_ABS is None else (it["val"] >= int(MIN_VALUE_ABS))
         if abs_ok and ((pv > 0 and vol_ratio >= VOLUME_SPIKE_RATIO) or (pval > 0 and val_ratio >= VALUE_SPIKE_RATIO)):
+            # 잡음 방지: 최소 +5% 이상일 때만 폭증 알림
             if it["pct"] >= 5.0:
                 it2 = dict(it)
                 it2["vol_ratio"] = vol_ratio
@@ -323,7 +391,7 @@ def fetch_rss_new_items(state: Dict, category: str, urls: List[str]) -> List[Dic
             link = (e.get("link") or "").strip()
             summary = (e.get("summary") or e.get("description") or "").strip()
 
-            # ✅ Biztoc이면 원문 링크로 교체
+            # ✅ Biztoc이면 "진짜 원문 링크"로 교체
             link = extract_source_link_if_biztoc(link)
 
             sid = stable_id(f"{category}|{title}|{link}")
@@ -391,10 +459,11 @@ def build_html_cards(title: str, items: List[Dict], badge_fn=None, max_n: int = 
         if badge_fn:
             badge = badge_fn(it) or ""
 
+        # ✅ target="_blank" 로 새 탭 열기(되튕김 방지)
         cards.append(f"""
         <div class="card">
           <div class="row">
-            <div class="title"><a href="{link}">{t}</a></div>
+            <div class="title"><a href="{link}" target="_blank" rel="noopener noreferrer">{t}</a></div>
             {badge}
           </div>
         </div>
@@ -442,16 +511,19 @@ def build_market_html(
     parts.append('<div class="hdr">📡 수시 레이더 (시장/공시/뉴스/코인)</div>')
     parts.append(f'<div class="sub">생성: {time.strftime("%Y-%m-%d %H:%M:%S")}</div>')
 
+    # 급등
     if alerts_kospi:
         parts.append(build_html_cards("📈 코스피 +8% 급등", alerts_kospi, badge_fn=badge_price, max_n=30))
     if alerts_kosdaq:
         parts.append(build_html_cards("🚀 코스닥 +8% 급등", alerts_kosdaq, badge_fn=badge_price, max_n=30))
 
+    # 폭증
     if spikes_kospi:
         parts.append(build_html_cards("📊 코스피 거래량/대금 폭증", spikes_kospi, badge_fn=badge_spike, max_n=30))
     if spikes_kosdaq:
         parts.append(build_html_cards("📊 코스닥 거래량/대금 폭증", spikes_kosdaq, badge_fn=badge_spike, max_n=30))
 
+    # 공시/미국/코인/한국경제
     if dart_items:
         parts.append(build_html_cards("📌 공시(DART) 신규", dart_items, max_n=30))
     if us_items:
@@ -486,7 +558,8 @@ def build_holdings_html(holdings_news: List[Dict]) -> str:
     for it in holdings_news[:40]:
         t = html_escape(it.get("title", ""))
         link = it.get("link", "#")
-        parts.append(f'<div class="card"><div class="title"><a href="{link}">{t}</a></div></div>')
+        # ✅ target="_blank" 로 새 탭 열기(되튕김 방지)
+        parts.append(f'<div class="card"><div class="title"><a href="{link}" target="_blank" rel="noopener noreferrer">{t}</a></div></div>')
 
     parts.append("</div>")
     return "\n".join(parts)
@@ -554,6 +627,7 @@ def main():
     send_dart = bool(dart_all) and cooldown_ok(state, "DART", COOLDOWN_DART_SEC)
     send_spikes = bool(alerts_kospi or alerts_kosdaq or spikes_kospi or spikes_kosdaq) and cooldown_ok(state, "SPIKES", COOLDOWN_SPIKES_SEC)
 
+    # 시장 메일에 포함할 항목(쿨다운 통과한 것만)
     market_us = us_all if send_us else []
     market_kr = korea_marked if send_kr else []
     market_crypto = crypto_all if send_crypto else []
@@ -567,11 +641,13 @@ def main():
     save_state(state)
 
     # 6) 발송
+    # (A) 보유종목 전용 즉시 메일
     if send_holdings:
         html_h = build_holdings_html(holdings_news)
         send_email("[보유종목 즉시] 뉴스", html_h)
         mark_sent(state, "HOLDINGS")
 
+    # (B) 시장 레이더 메일 (내용이 하나라도 있을 때만)
     has_market_any = any([
         market_alerts_kospi, market_alerts_kosdaq,
         market_spikes_kospi, market_spikes_kosdaq,
@@ -607,6 +683,7 @@ def main():
         if send_dart: mark_sent(state, "DART")
         if send_spikes: mark_sent(state, "SPIKES")
 
+    # 마지막으로 last_sent 갱신 저장
     save_state(state)
     print("Done.")
 
