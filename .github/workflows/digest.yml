@@ -1,0 +1,32 @@
+name: RSS Digest Mailer
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # 30분마다 자동 실행
+  workflow_dispatch:
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install deps
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run digest
+      env:
+        SMTP_USER: ${{ secrets.SMTP_USER }}
+        SMTP_PASS: ${{ secrets.SMTP_PASS }}
+        MAIL_TO: ${{ secrets.MAIL_TO }}
+      run: |
+        python rss_digest.py
