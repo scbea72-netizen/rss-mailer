@@ -4,13 +4,15 @@ import json
 import time
 import hashlib
 import smtplib
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import requests
 import feedparser
 from bs4 import BeautifulSoup
-from email.message import EmailMessage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 STATE_DIR = Path(".state")
 STATE_FILE = STATE_DIR / "state.json"
@@ -85,6 +87,33 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (rss-mailer; GitHub Actions)",
 }
 
+# =========================
+# Biztoc 링크 -> 원문 링크로 변환
+# =========================
+def extract_source_link_if_biztoc(url: str) -> str:
+    if not url or "biztoc.com" not in url:
+        return url
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # 페이지 내 외부(원문) 링크 후보를 우선 반환
+        for a in soup.find_all("a", href=True):
+            href = (a.get("href") or "").strip()
+            if href.startswith("http") and "biztoc.com" not in href:
+                return href
+
+        # fallback: 텍스트에서 URL 하나라도 추출
+        text = soup.get_text(" ", strip=True)
+        m = re.search(r"https?://[^\s\"'>]+", text)
+        if m and "biztoc.com" not in m.group(0):
+            return m.group(0)
+
+        return r.url
+    except Exception:
+        return url
+
 
 # =========================
 # State
@@ -129,7 +158,6 @@ def parse_int(s: str) -> int:
     s = (s or "").replace(",", "").strip()
     if s == "" or s == "-":
         return 0
-    # sometimes there are non-digit chars
     out = "".join(ch for ch in s if ch.isdigit())
     return int(out) if out else 0
 
@@ -191,14 +219,11 @@ def fetch_risers(url: str, top_n: int = 30) -> List[Dict]:
         except Exception:
             continue
 
-        # 거래량/거래대금 (페이지 표기 단위 그대로 숫자만 추출)
         vol = parse_int(tds[5].get_text(strip=True)) if len(tds) > 5 else 0
         val = parse_int(tds[6].get_text(strip=True)) if len(tds) > 6 else 0
 
         link = f"https://finance.naver.com{href}"
-        results.append(
-            {"code": code, "name": name, "pct": pct, "price": price, "vol": vol, "val": val, "link": link}
-        )
+        results.append({"code": code, "name": name, "pct": pct, "price": price, "vol": vol, "val": val, "link": link})
         if len(results) >= top_n:
             break
 
@@ -206,13 +231,6 @@ def fetch_risers(url: str, top_n: int = 30) -> List[Dict]:
 
 
 def detect_price_alerts_and_spikes(state: Dict) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict]]:
-    """
-    4종 결과:
-    - 코스피 급등(가격)
-    - 코스닥 급등(가격)
-    - 코스피 폭증(거래량/대금)
-    - 코스닥 폭증(거래량/대금)
-    """
     alerts_kospi: List[Dict] = []
     alerts_kosdaq: List[Dict] = []
     spikes_kospi: List[Dict] = []
@@ -238,13 +256,11 @@ def detect_price_alerts_and_spikes(state: Dict) -> Tuple[List[Dict], List[Dict],
         new_last_kospi_pct[key] = it["pct"]
         new_last_kospi_m[key] = {"vol": it["vol"], "val": it["val"]}
 
-        # 가격 급등(+8%)
         if it["pct"] >= KOSPI_ALERT_PCT:
             prev = float(last_kospi_pct.get(key, -999))
             if (key not in last_kospi_pct) or (it["pct"] - prev >= 0.5):
                 alerts_kospi.append(it)
 
-        # 거래량/대금 폭증
         prev_m = last_kospi_m.get(key, {"vol": 0, "val": 0})
         pv, pval = int(prev_m.get("vol", 0)), int(prev_m.get("val", 0))
         vol_ratio = (it["vol"] / pv) if pv > 0 else 0.0
@@ -252,7 +268,6 @@ def detect_price_alerts_and_spikes(state: Dict) -> Tuple[List[Dict], List[Dict],
 
         abs_ok = True if MIN_VALUE_ABS is None else (it["val"] >= int(MIN_VALUE_ABS))
         if abs_ok and ((pv > 0 and vol_ratio >= VOLUME_SPIKE_RATIO) or (pval > 0 and val_ratio >= VALUE_SPIKE_RATIO)):
-            # 너무 잡음 방지: 최소 +1% 이상일 때만 폭증 알림(원하면 0으로 바꿔도 됨)
             if it["pct"] >= 5.0:
                 it2 = dict(it)
                 it2["vol_ratio"] = vol_ratio
@@ -308,6 +323,9 @@ def fetch_rss_new_items(state: Dict, category: str, urls: List[str]) -> List[Dic
             link = (e.get("link") or "").strip()
             summary = (e.get("summary") or e.get("description") or "").strip()
 
+            # ✅ Biztoc이면 원문 링크로 교체
+            link = extract_source_link_if_biztoc(link)
+
             sid = stable_id(f"{category}|{title}|{link}")
             if sid in seen:
                 continue
@@ -337,9 +355,7 @@ def mark_policy_priority(items: List[Dict]) -> List[Dict]:
 
 
 # =========================
-# 기관/외국인 수급 힌트 (가능한 범위에서)
-# - 네이버 frgn 페이지를 "알림 대상 종목"에 한해서만 조회
-# - 실패해도 전체 메일은 정상 발송
+# 기관/외국인 수급 힌트
 # =========================
 def try_fetch_investor_hint(code: str) -> Optional[str]:
     if not code or not code.isdigit():
@@ -349,11 +365,8 @@ def try_fetch_investor_hint(code: str) -> Optional[str]:
         r = requests.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-
-        # 페이지 구조가 바뀔 수 있어, "표 텍스트"에서 키워드만 잡는 보수적 접근
         text = soup.get_text(" ", strip=True)
 
-        # 힌트 키워드만 간단히 표시(정밀 파싱 대신 안전성 우선)
         hints = []
         if "외국인" in text:
             hints.append("외국인")
@@ -401,7 +414,6 @@ def build_market_html(
     crypto_items: List[Dict],
     korea_items: List[Dict],
 ) -> str:
-    # 모바일 친화 HTML
     style = """
     <style>
       body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 0; padding: 0; }
@@ -412,7 +424,6 @@ def build_market_html(
       .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
       .title { font-size: 14px; font-weight: 700; line-height: 1.35; }
       .title a { text-decoration: none; color: #111; }
-      .meta { font-size: 12px; color: #666; margin-top: 6px; }
       .pill { display: inline-block; padding: 4px 8px; border-radius: 999px; background: #f4f4f4; font-size: 12px; white-space: nowrap; }
       .pill.hot { background: #ffe9e9; }
       .pill.warn { background: #fff5d6; }
@@ -431,19 +442,16 @@ def build_market_html(
     parts.append('<div class="hdr">📡 수시 레이더 (시장/공시/뉴스/코인)</div>')
     parts.append(f'<div class="sub">생성: {time.strftime("%Y-%m-%d %H:%M:%S")}</div>')
 
-    # 급등
     if alerts_kospi:
         parts.append(build_html_cards("📈 코스피 +8% 급등", alerts_kospi, badge_fn=badge_price, max_n=30))
     if alerts_kosdaq:
         parts.append(build_html_cards("🚀 코스닥 +8% 급등", alerts_kosdaq, badge_fn=badge_price, max_n=30))
 
-    # 폭증
     if spikes_kospi:
         parts.append(build_html_cards("📊 코스피 거래량/대금 폭증", spikes_kospi, badge_fn=badge_spike, max_n=30))
     if spikes_kosdaq:
         parts.append(build_html_cards("📊 코스닥 거래량/대금 폭증", spikes_kosdaq, badge_fn=badge_spike, max_n=30))
 
-    # 공시/미국/코인/한국경제
     if dart_items:
         parts.append(build_html_cards("📌 공시(DART) 신규", dart_items, max_n=30))
     if us_items:
@@ -484,22 +492,23 @@ def build_holdings_html(holdings_news: List[Dict]) -> str:
     return "\n".join(parts)
 
 
+# =========================
+# Email Send (Hanmail/Daum SMTP Submission)
+# =========================
 def send_email(subject: str, html_body: str) -> None:
+    # ✅ 한메일 로그인 제출 방식 (MX 직송 금지)
     SMTP_HOST = "smtp.daum.net"
     SMTP_PORT = 465
+
     user = os.environ["SMTP_USER"]
     pwd = os.environ["SMTP_PASS"]
     mail_to = os.environ.get("MAIL_TO", user)
-
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = user
     msg["To"] = mail_to
 
-    # Plain + HTML 같이 보내야 스팸 차단 안 됨
     plain = "자동 뉴스 요약 메일입니다.\n(HTML이 보이지 않으면 웹버전을 확인해주세요)"
     msg.attach(MIMEText(plain, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
@@ -530,15 +539,12 @@ def main():
     korea_marked = mark_policy_priority(korea_all)
 
     # 4) 기관/외국인 힌트(알림 종목에만, best-effort)
-    #    (너무 과하면 차단될 수 있으니, 최대 6개만)
     for it in (alerts_kospi + alerts_kosdaq + spikes_kospi + spikes_kosdaq)[:6]:
         hint = try_fetch_investor_hint(it.get("code", ""))
         if hint:
             it["investor_hint"] = hint
 
     # 5) 각 버킷별 발송 판단 + 쿨다운 적용
-    #    - 보유종목 즉시 메일(별도)
-    #    - 시장/공시/뉴스/코인 묶음 메일(단, 미국/한국/코인은 쿨다운)
     send_holdings = bool(holdings_news) and cooldown_ok(state, "HOLDINGS", COOLDOWN_HOLDINGS_SEC)
 
     send_us = bool(us_all) and cooldown_ok(state, "US", COOLDOWN_US_SEC)
@@ -548,7 +554,6 @@ def main():
     send_dart = bool(dart_all) and cooldown_ok(state, "DART", COOLDOWN_DART_SEC)
     send_spikes = bool(alerts_kospi or alerts_kosdaq or spikes_kospi or spikes_kosdaq) and cooldown_ok(state, "SPIKES", COOLDOWN_SPIKES_SEC)
 
-    # 시장 메일에 포함할 항목(쿨다운 통과한 것만)
     market_us = us_all if send_us else []
     market_kr = korea_marked if send_kr else []
     market_crypto = crypto_all if send_crypto else []
@@ -562,13 +567,11 @@ def main():
     save_state(state)
 
     # 6) 발송
-    # (A) 보유종목 전용 즉시 메일
     if send_holdings:
         html_h = build_holdings_html(holdings_news)
         send_email("[보유종목 즉시] 뉴스", html_h)
         mark_sent(state, "HOLDINGS")
 
-    # (B) 시장 레이더 메일 (내용이 하나라도 있을 때만)
     has_market_any = any([
         market_alerts_kospi, market_alerts_kosdaq,
         market_spikes_kospi, market_spikes_kosdaq,
@@ -604,7 +607,6 @@ def main():
         if send_dart: mark_sent(state, "DART")
         if send_spikes: mark_sent(state, "SPIKES")
 
-    # 마지막으로 last_sent 갱신 저장
     save_state(state)
     print("Done.")
 
