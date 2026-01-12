@@ -17,7 +17,7 @@ from email.mime.text import MIMEText
 # =========================
 # Config / State
 # =========================
-STATE_DIR = Path(".state_test")
+STATE_DIR = Path(".state")
 STATE_FILE = STATE_DIR / "state.json"
 
 # 급등 기준
