@@ -29,6 +29,7 @@ from typing import List, Dict, Any, Optional
 import requests
 import feedparser
 from dateutil import parser as dtparser
+from googletrans import Translator
 
 # -----------------------------
 # 1) RSS FEEDS (NO BIZTOC)
@@ -197,6 +198,30 @@ def escape_html(s: str) -> str:
          .replace("'", "&#39;")
     )
 
+_TRANSLATOR = None
+
+def is_korean_text(s: str) -> bool:
+    return any('가' <= ch <= '힣' for ch in s)
+
+def looks_english(s: str) -> bool:
+    if not s:
+        return False
+    ascii_ratio = sum(1 for ch in s if ord(ch) < 128) / max(1, len(s))
+    return ascii_ratio > 0.9 and not is_korean_text(s)
+
+def translate_title_to_ko(title: str) -> str:
+    global _TRANSLATOR
+    if not looks_english(title):
+        return title
+    try:
+        if _TRANSLATOR is None:
+            _TRANSLATOR = Translator()
+        out = _TRANSLATOR.translate(title, src="auto", dest="ko")
+        ko = (out.text or "").strip()
+        return ko if ko else title
+    except Exception:
+        return title
+
 def build_email_html(items: List[Dict[str, Any]]) -> str:
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for it in items:
@@ -214,7 +239,14 @@ def build_email_html(items: List[Dict[str, Any]]) -> str:
         html.append(f"<h3>{feed_name} ({len(feed_items)})</h3>")
         html.append("<ul>")
         for it in feed_items:
-            title = escape_html(it["title"])
+           original = it["title"]
+ko_title = translate_title_to_ko(original)
+
+if ko_title != original:
+    title = escape_html(ko_title) + f"<br/><small style='color:#777'>({escape_html(original)})</small>"
+else:
+    title = escape_html(original)
+
             link = it["link"]
             final_link = resolve_final_url(link)
 
