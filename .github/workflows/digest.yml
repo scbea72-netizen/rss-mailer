@@ -2,11 +2,9 @@ name: RSS Digest Mailer
 
 on:
   schedule:
-    # 가장 촘촘한 폴링(실시간에 가장 근접). GitHub 스케줄은 완전 실시간 푸시가 아닙니다.
     - cron: "* * * * *"
   workflow_dispatch:
 
-# 같은 워크플로우가 겹치면 중복 메일이 갈 수 있어 동시 실행을 차단합니다.
 concurrency:
   group: rss-digest-mailer
   cancel-in-progress: true
@@ -30,15 +28,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-
-    - name: Restore cache (dedupe state)
-      uses: actions/cache@v4
-      with:
-        path: .cache/rss
-        key: rss-digest-cache
-        restore-keys: |
-          rss-digest-cache
-
+      - name: Restore cache (dedupe state)
+        uses: actions/cache@v4
+        with:
+          path: .cache/rss
+          key: rss-digest-cache
+          restore-keys: |
+            rss-digest-cache
 
       - name: Run digest
         env:
@@ -49,5 +45,3 @@ jobs:
           MAIL_TO:   ${{ secrets.MAIL_TO }}
         run: |
           python rss_digest.py
-
-
