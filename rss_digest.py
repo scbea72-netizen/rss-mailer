@@ -238,28 +238,28 @@ def build_email_html(items: List[Dict[str, Any]]) -> str:
     for feed_name, feed_items in grouped.items():
         html.append(f"<h3>{feed_name} ({len(feed_items)})</h3>")
         html.append("<ul>")
-        for it in feed_items:
-           original = it["title"]
-ko_title = translate_title_to_ko(original)
+       for it in feed_items:
+    original = it["title"]
+    ko_title = translate_title_to_ko(original)
 
-if ko_title != original:
-    title = escape_html(ko_title) + f"<br/><small style='color:#777'>({escape_html(original)})</small>"
-else:
-    title = escape_html(original)
+    if ko_title != original:
+        title = escape_html(ko_title) + f"<br/><small style='color:#777'>({escape_html(original)})</small>"
+    else:
+        title = escape_html(original)
 
-            link = it["link"]
-            final_link = resolve_final_url(link)
+    link = it["link"]
+    final_link = resolve_final_url(link)
 
-            t = it.get("time")
+    t = it.get("time")
+    t_str = ""
+    if t:
+        try:
+            t_str = t.astimezone().strftime("%Y-%m-%d %H:%M")
+        except Exception:
             t_str = ""
-            if t:
-                try:
-                    t_str = t.astimezone().strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    t_str = ""
-            meta = f" <small style='color:#666'>({t_str})</small>" if t_str else ""
-            html.append(f"<li><a href='{final_link}'>{title}</a>{meta}</li>")
-        html.append("</ul><hr/>")
+    meta = f" <small style='color:#666'>({t_str})</small>" if t_str else ""
+
+    html.append(f"<li><a href='{final_link}'>{title}</a>{meta}</li>")
 
     return "\n".join(html)
 
