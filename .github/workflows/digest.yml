@@ -30,6 +30,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+
+    - name: Restore cache (dedupe state)
+      uses: actions/cache@v4
+      with:
+        path: .cache/rss
+        key: rss-digest-cache
+        restore-keys: |
+          rss-digest-cache
+
+
       - name: Run digest
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -39,4 +49,5 @@ jobs:
           MAIL_TO:   ${{ secrets.MAIL_TO }}
         run: |
           python rss_digest.py
+
 
