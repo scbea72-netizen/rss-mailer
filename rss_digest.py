@@ -108,17 +108,28 @@ def build_email_html(items):
 # -----------------------------
 # SEND
 # -----------------------------
-def send_mail(subject, html_body):
+def send_mail(subject: str, html_body: str) -> None:
+    if not SMTP_USER or not SMTP_PASS or not MAIL_TO:
+        raise RuntimeError("SMTP_USER/SMTP_PASS/MAIL_TO 환경변수가 비어있습니다.")
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = MAIL_FROM
     msg["To"] = MAIL_TO
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
-        s.login(SMTP_USER, SMTP_PASS)
-        s.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
-
+    # 465 = SSL / 그 외 = STARTTLS
+    if SMTP_PORT == 465:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
 # -----------------------------
 # MAIN
 # -----------------------------
