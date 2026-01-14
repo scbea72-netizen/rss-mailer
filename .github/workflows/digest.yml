@@ -2,33 +2,41 @@ name: RSS Digest Mailer
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # 가장 촘촘한 폴링(실시간에 가장 근접). GitHub 스케줄은 완전 실시간 푸시가 아닙니다.
+    - cron: "* * * * *"
   workflow_dispatch:
+
+# 같은 워크플로우가 겹치면 중복 메일이 갈 수 있어 동시 실행을 차단합니다.
+concurrency:
+  group: rss-digest-mailer
+  cancel-in-progress: true
 
 jobs:
   send-digest:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Install deps
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Run digest
-      env:
-        SMTP_HOST: ${{ secrets.SMTP_HOST }}
-        SMTP_PORT: ${{ secrets.SMTP_PORT }}
-        SMTP_USER: ${{ secrets.SMTP_USER }}
-        SMTP_PASS: ${{ secrets.SMTP_PASS }}
-        MAIL_TO:   ${{ secrets.MAIL_TO }}
-      run: |
-        python rss_digest.py
+      - name: Run digest
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO:   ${{ secrets.MAIL_TO }}
+        run: |
+          python rss_digest.py
+
