@@ -6,7 +6,7 @@ rss_digest.py
 - RSS 새 글만 메일 발송 (중복 제거 캐시)
 - Biztoc 차단
 - 제목만 한국어로 번역(영어/일본어 등 비한글 제목 → 한국어)
-- 국가/소스 그룹별로 분리 발송: US / KR / JP
+- 미국/한국/일본(US/KR/JP) 3개 소스를 "한 통"의 메일로 합쳐서 발송
 - SMTP: SSL/STARTTLS 자동 재시도 (Secrets 확인 불가 상황도 대응)
 
 Requirements:
@@ -242,47 +242,60 @@ def translate_title_to_ko(title: str) -> str:
 
 
 # -----------------------------
-# 5) 메일 HTML 생성 (카테고리별 분리)
+# 5) 메일 HTML 생성 (US/KR/JP 한 통)
 # -----------------------------
 CATEGORY_SUBJECT = {"US": "미국/글로벌", "KR": "한국", "JP": "일본"}
 
-def build_email_html(items: List[Dict[str, Any]], category: str) -> str:
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
+def build_email_html(items: List[Dict[str, Any]]) -> str:
+    # category -> feed -> items
+    grouped: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     for it in items:
-        grouped.setdefault(it["feed"], []).append(it)
-
-    for k in grouped:
-        grouped[k].sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
+        grouped.setdefault(it["category"], {}).setdefault(it["feed"], []).append(it)
 
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
-    cat_name = CATEGORY_SUBJECT.get(category, category)
+    html: List[str] = [
+        f"<h2>{SUBJECT_PREFIX} {now_local}</h2>",
+        "<p style='color:#666'>※ 미국/한국/일본 뉴스가 한 통으로 발송됩니다. 제목만 한국어로 번역됩니다.</p>",
+        "<hr/>",
+    ]
 
-    html = [f"<h2>{SUBJECT_PREFIX} [{cat_name}] {now_local}</h2>"]
-    html.append("<p style='color:#666'>※ 제목만 한국어로 번역됩니다.</p><hr/>")
+    # 항상 US -> KR -> JP 순서
+    for category in ["US", "KR", "JP"]:
+        feeds = grouped.get(category, {})
+        if not feeds:
+            continue
 
-    for feed_name, feed_items in grouped.items():
-        html.append(f"<h3>{escape_html(feed_name)} ({len(feed_items)})</h3>")
-        html.append("<ul>")
+        cat_name = CATEGORY_SUBJECT.get(category, category)
+        html.append(f"<h2>[ {escape_html(cat_name)} ]</h2>")
 
-        for it in feed_items:
-            title_ko = translate_title_to_ko(it["title"])
-            title = escape_html(title_ko)
+        # feed 이름 정렬 (보기 좋게)
+        for feed_name in sorted(feeds.keys()):
+            feed_items = feeds[feed_name]
+            feed_items.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
 
-            link = it["link"]
-            final_link = resolve_final_url(link)
+            html.append(f"<h3>{escape_html(feed_name)} ({len(feed_items)})</h3>")
+            html.append("<ul>")
 
-            t = it.get("time")
-            t_str = ""
-            if t:
-                try:
-                    t_str = t.astimezone().strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    t_str = ""
+            for it in feed_items:
+                title_ko = translate_title_to_ko(it["title"])
+                title = escape_html(title_ko)
 
-            meta = f" <small style='color:#666'>({t_str})</small>" if t_str else ""
-            html.append(f"<li><a href='{final_link}'>{title}</a>{meta}</li>")
+                final_link = resolve_final_url(it["link"])
 
-        html.append("</ul><hr/>")
+                t = it.get("time")
+                t_str = ""
+                if t:
+                    try:
+                        t_str = t.astimezone().strftime("%Y-%m-%d %H:%M")
+                    except Exception:
+                        t_str = ""
+
+                meta = f" <small style='color:#666'>({t_str})</small>" if t_str else ""
+                html.append(f"<li><a href='{final_link}'>{title}</a>{meta}</li>")
+
+            html.append("</ul><br/>")
+
+        html.append("<hr/>")
 
     return "\n".join(html)
 
@@ -302,6 +315,7 @@ def send_mail(subject: str, html_body: str) -> None:
 
     last_err: Optional[Exception] = None
 
+    # 1) SSL 우선
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
             s.login(SMTP_USER, SMTP_PASS)
@@ -310,6 +324,7 @@ def send_mail(subject: str, html_body: str) -> None:
     except Exception as e:
         last_err = e
 
+    # 2) STARTTLS 재시도
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
             s.ehlo()
@@ -324,13 +339,9 @@ def send_mail(subject: str, html_body: str) -> None:
     raise RuntimeError(f"SMTP 전송 실패: {last_err}")
 
 
-def split_by_category(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    for it in items:
-        out.setdefault(it["category"], []).append(it)
-    return out
-
-
+# -----------------------------
+# 7) MAIN
+# -----------------------------
 def main() -> int:
     cache = load_cache()
     all_items: List[Dict[str, Any]] = []
@@ -358,21 +369,16 @@ def main() -> int:
         save_cache(cache)
         return 0
 
-    by_cat = split_by_category(fresh)
-
-    for category, items in by_cat.items():
-        items.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
-        cat_name = CATEGORY_SUBJECT.get(category, category)
-        subject = f"{SUBJECT_PREFIX} [{cat_name}] {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        html = build_email_html(items, category)
-        send_mail(subject, html)
-        print(f"[OK] Sent {len(items)} items ({category}) to {MAIL_TO}")
+    # 전체를 한 통으로 발송
+    fresh.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
+    subject = f"{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    html = build_email_html(fresh)
+    send_mail(subject, html)
 
     save_cache(cache)
-    print(f"[OK] cache saved: {CACHE_PATH}")
+    print(f"[OK] Sent {len(fresh)} items to {MAIL_TO} | cache={CACHE_PATH}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
