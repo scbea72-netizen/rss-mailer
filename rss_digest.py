@@ -2,23 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-rss_digest.py (fixed)
-- Biztoc / jina.ai->biztoc links are blocked by 403/captcha and cannot be used reliably in automation.
-- This script ONLY uses direct publisher RSS feeds and SKIPS any biztoc links if they appear.
-- Sends a daily/periodic digest email via SMTP.
+rss_digest.py (improved for GitHub Actions)
+- Sends ONLY new items (dedupe via persistent cache)
+- Skips Biztoc / r.jina.ai->biztoc links
+- Optional: resolve final redirect URL (default OFF for speed/stability)
 
 Requirements:
   pip install requests feedparser python-dateutil
-
-Usage:
-  python rss_digest.py
-
-Recommended: set env vars:
-  SMTP_HOST=smtp.hanmail.net
-  SMTP_PORT=465
-  SMTP_USER=your_id@hanmail.net
-  SMTP_PASS=your_app_password_or_password
-  MAIL_TO=your_id@hanmail.net
 """
 
 from __future__ import annotations
@@ -34,7 +24,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import smtplib
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 import requests
 import feedparser
@@ -51,7 +41,6 @@ FEEDS: List[Dict[str, str]] = [
     {"name": "YNA - Market", "url": "https://www.yna.co.kr/rss/market.xml"},
     {"name": "YNA - Economy", "url": "https://www.yna.co.kr/rss/economy.xml"},
     {"name": "DART - Disclosures", "url": "https://opendart.fss.or.kr/api/rss.xml"},
-    # 필요하면 여기에 "원문 RSS"만 추가하세요.
 ]
 
 # -----------------------------
@@ -59,24 +48,25 @@ FEEDS: List[Dict[str, str]] = [
 # -----------------------------
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.hanmail.net")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))  # SSL: 465, STARTTLS: 587
-SMTP_USER = os.getenv("SMTP_USER", "")          # e.g. tactnet@hanmail.net
-SMTP_PASS = os.getenv("SMTP_PASS", "")          # password (or app password)
-MAIL_TO   = os.getenv("MAIL_TO", SMTP_USER)     # default: send to self
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+MAIL_TO   = os.getenv("MAIL_TO", SMTP_USER)
 MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
 
-# Digest subject prefix
 SUBJECT_PREFIX = os.getenv("SUBJECT_PREFIX", "[RSS DIGEST]")
 
-# Fetch limits
 MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "30"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 
 # Only include items newer than N hours (optional)
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "48"))
 
-# Cache to prevent duplicates
-CACHE_PATH = Path(os.getenv("CACHE_PATH", "sent_cache.json"))
+# IMPORTANT: cache must persist across runs (GitHub Actions cache will store this folder)
+CACHE_PATH = Path(os.getenv("CACHE_PATH", ".cache/rss/sent_cache.json"))
 CACHE_MAX_KEYS = int(os.getenv("CACHE_MAX_KEYS", "5000"))
+
+# Optional: resolve final redirect URL (can be slow / sometimes blocked)
+RESOLVE_FINAL_URL = os.getenv("RESOLVE_FINAL_URL", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
 
 # -----------------------------
 # 3) BIZTOC / JINA BLOCK RULES
@@ -91,7 +81,6 @@ def is_biztoc_url(url: str) -> bool:
         host = (u.hostname or "").lower()
         if BIZTOC_HOST_RE.search(host):
             return True
-        # proxy 형태로 biztoc이 들어가도 차단
         if JINA_PROXY_RE.search(url) and "biztoc.com" in url.lower():
             return True
         return False
@@ -99,46 +88,36 @@ def is_biztoc_url(url: str) -> bool:
         return False
 
 def resolve_final_url(url: str) -> str:
-    """
-    Resolve redirects (for normal publishers).
-    NOTE: Biztoc is skipped before calling this.
-    """
+    """Resolve redirects (for normal publishers). Biztoc is skipped before calling this."""
+    if not RESOLVE_FINAL_URL:
+        return url
     try:
-        # HEAD 먼저 (일부 사이트는 HEAD 막아서 GET으로 fallback)
-        r = requests.head(url, allow_redirects=True, timeout=REQUEST_TIMEOUT, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; RSSDigest/1.0)"
-        })
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; RSSDigest/1.0)"}
+        r = requests.head(url, allow_redirects=True, timeout=REQUEST_TIMEOUT, headers=headers)
         if r.status_code >= 400 or not r.url:
-            r = requests.get(url, allow_redirects=True, timeout=REQUEST_TIMEOUT, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; RSSDigest/1.0)"
-            })
+            r = requests.get(url, allow_redirects=True, timeout=REQUEST_TIMEOUT, headers=headers)
         return r.url or url
     except Exception:
         return url
 
 def parse_entry_time(entry: Dict[str, Any]) -> Optional[datetime]:
-    """
-    Attempt to parse entry published/updated time.
-    """
     for key in ("published", "updated", "created"):
-        if key in entry and entry[key]:
+        if entry.get(key):
             try:
                 dt = dtparser.parse(entry[key])
                 if not dt.tzinfo:
                     dt = dt.replace(tzinfo=timezone.utc)
                 return dt
             except Exception:
-                continue
+                pass
 
-    # feedparser sometimes provides *_parsed
     for key in ("published_parsed", "updated_parsed"):
-        if key in entry and entry[key]:
+        if entry.get(key):
             try:
-                # time.struct_time -> datetime
                 dt = datetime.fromtimestamp(time.mktime(entry[key]), tz=timezone.utc)
                 return dt
             except Exception:
-                continue
+                pass
     return None
 
 def load_cache() -> Dict[str, float]:
@@ -146,16 +125,14 @@ def load_cache() -> Dict[str, float]:
         try:
             data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                # key -> timestamp
                 return {k: float(v) for k, v in data.items()}
         except Exception:
             pass
     return {}
 
 def save_cache(cache: Dict[str, float]) -> None:
-    # trim
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     if len(cache) > CACHE_MAX_KEYS:
-        # 오래된 순으로 삭제
         items = sorted(cache.items(), key=lambda kv: kv[1])
         cache = dict(items[-CACHE_MAX_KEYS:])
     CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -166,28 +143,26 @@ def make_key(feed_name: str, title: str, link: str) -> str:
 
 def fetch_feed_items(feed: Dict[str, str]) -> List[Dict[str, Any]]:
     url = feed["url"]
-    # 직접 RSS만 사용 (biztoc url이면 제외)
     if is_biztoc_url(url):
         return []
 
     parsed = feedparser.parse(url)
-    items = []
+    items: List[Dict[str, Any]] = []
+
     for entry in parsed.entries[:MAX_ITEMS_PER_FEED]:
         title = (entry.get("title") or "").strip()
         link  = (entry.get("link") or "").strip()
 
-        # 어떤 피드는 origLink 같은게 있음
-        # (가능하면 원문을 우선)
+        # 일부 피드는 원문 링크 키가 따로 있음
         for alt_key in ("feedburner_origlink", "origlink", "link"):
             alt = entry.get(alt_key)
-            if alt and isinstance(alt, str) and alt.strip():
+            if isinstance(alt, str) and alt.strip():
                 link = alt.strip()
                 break
 
         if not title or not link:
             continue
 
-        # Biztoc 링크면 스킵 (핵심)
         if is_biztoc_url(link):
             continue
 
@@ -199,34 +174,39 @@ def fetch_feed_items(feed: Dict[str, str]) -> List[Dict[str, Any]]:
             "time": dt,
             "summary": (entry.get("summary") or "").strip()
         })
+
     return items
 
 def filter_recent(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if MAX_AGE_HOURS <= 0:
         return items
     cutoff = datetime.now(timezone.utc).timestamp() - (MAX_AGE_HOURS * 3600)
-    out = []
+    out: List[Dict[str, Any]] = []
     for it in items:
         dt = it.get("time")
-        if not dt:
-            out.append(it)  # 시간 없으면 포함
-            continue
-        if dt.timestamp() >= cutoff:
+        if not dt or dt.timestamp() >= cutoff:
             out.append(it)
     return out
 
+def escape_html(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+         .replace("'", "&#39;")
+    )
+
 def build_email_html(items: List[Dict[str, Any]]) -> str:
-    # 피드별 그룹
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for it in items:
         grouped.setdefault(it["feed"], []).append(it)
 
-    # 최신순 정렬
     for k in grouped:
         grouped[k].sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    html = [f"<h2>{SUBJECT_PREFIX} {now}</h2>"]
+    now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
+    html = [f"<h2>{SUBJECT_PREFIX} {now_local}</h2>"]
     html.append("<p>※ Biztoc 링크는 403/캡차 차단으로 자동 스킵됩니다. 원문 RSS만 포함합니다.</p>")
     html.append("<hr/>")
 
@@ -236,8 +216,6 @@ def build_email_html(items: List[Dict[str, Any]]) -> str:
         for it in feed_items:
             title = escape_html(it["title"])
             link = it["link"]
-
-            # 일반 사이트는 리다이렉트 최종 링크로 정리(선택)
             final_link = resolve_final_url(link)
 
             t = it.get("time")
@@ -249,33 +227,20 @@ def build_email_html(items: List[Dict[str, Any]]) -> str:
                     t_str = ""
             meta = f" <small style='color:#666'>({t_str})</small>" if t_str else ""
             html.append(f"<li><a href='{final_link}'>{title}</a>{meta}</li>")
-        html.append("</ul>")
-        html.append("<hr/>")
+        html.append("</ul><hr/>")
 
     return "\n".join(html)
 
-def escape_html(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-         .replace("<", "&lt;")
-         .replace(">", "&gt;")
-         .replace('"', "&quot;")
-         .replace("'", "&#39;")
-    )
-
 def send_mail(subject: str, html_body: str) -> None:
     if not SMTP_USER or not SMTP_PASS or not MAIL_TO:
-        raise RuntimeError("SMTP_USER/SMTP_PASS/MAIL_TO 환경변수가 비어있습니다. 계정 정보를 설정하세요.")
+        raise RuntimeError("SMTP_USER/SMTP_PASS/MAIL_TO 환경변수가 비어있습니다. GitHub Secrets를 확인하세요.")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = MAIL_FROM
     msg["To"] = MAIL_TO
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    part_html = MIMEText(html_body, "html", "utf-8")
-    msg.attach(part_html)
-
-    # SSL 465 기본
     if SMTP_PORT == 465:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as server:
             server.login(SMTP_USER, SMTP_PASS)
@@ -291,18 +256,14 @@ def main() -> int:
     cache = load_cache()
     all_items: List[Dict[str, Any]] = []
 
-    # 1) fetch
     for feed in FEEDS:
         try:
-            items = fetch_feed_items(feed)
-            items = filter_recent(items)
+            items = filter_recent(fetch_feed_items(feed))
             all_items.extend(items)
         except Exception:
-            # feed 하나 죽어도 전체는 계속
             print(f"[WARN] feed failed: {feed.get('name')} ({feed.get('url')})")
             traceback.print_exc()
 
-    # 2) dedupe by cache
     fresh: List[Dict[str, Any]] = []
     now_ts = time.time()
     for it in all_items:
@@ -317,16 +278,14 @@ def main() -> int:
         save_cache(cache)
         return 0
 
-    # 3) sort overall 최신순
     fresh.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
 
-    # 4) build & send
-    subject = f"{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d')}"
+    subject = f"{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     html = build_email_html(fresh)
     send_mail(subject, html)
 
     save_cache(cache)
-    print(f"[OK] Sent {len(fresh)} items to {MAIL_TO}")
+    print(f"[OK] Sent {len(fresh)} items to {MAIL_TO} | cache={CACHE_PATH}")
     return 0
 
 if __name__ == "__main__":
