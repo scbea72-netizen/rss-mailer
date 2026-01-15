@@ -1,9 +1,9 @@
 name: Stock Radar (US/JP/KR)
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "*/30 * * * *"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,70 +12,67 @@ jobs:
   radar:
     runs-on: ubuntu-latest
 
-    # ✅ 핵심: Secrets 이름이 TELEGRAM_* 이든 TG_* 이든 자동으로 잡히게 함
-    # - TELEGRAM_TOKEN  : secrets.TELEGRAM_TOKEN 우선, 없으면 secrets.TG_BOT_TOKEN
-    # - TELEGRAM_CHAT_ID: secrets.TELEGRAM_CHAT_ID 우선, 없으면 secrets.TG_CHAT_ID, 없으면 secrets.TG_CHAT_ID_US
-    #
-    # ✅ 그리고 레거시 호환을 위해 TG_BOT_TOKEN / TG_CHAT_ID 도 같이 세팅
     env:
-      # ===== Telegram (new) =====
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN || secrets.TG_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || secrets.TG_CHAT_ID || secrets.TG_CHAT_ID_US }}
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID_US: ${{ secrets.TG_CHAT_ID_US }}
+      TG_CHAT_ID_JP: ${{ secrets.TG_CHAT_ID_JP }}
+      TG_CHAT_ID_KR: ${{ secrets.TG_CHAT_ID_KR }}
 
-      # ===== Telegram (legacy compatibility) =====
-      TG_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN || secrets.TG_BOT_TOKEN }}
-      TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || secrets.TG_CHAT_ID || secrets.TG_CHAT_ID_US }}
-
-      # ===== Radar params =====
+      PCT_MIN: 3.0
+      ABS_MODE: 0
       MAX_TICKERS: 4000
       BATCH_SIZE: 200
 
-      # ✅ 등락률 기준(거래량 제거 버전에서 사용)
-      PCT_MIN: 3.0
-      ABS_MODE: 0
-
-      # (선택) 메일 관련 쓰면 유지
-      EMAIL_TO: ${{ secrets.EMAIL_TO }}
-      SMTP_HOST: ${{ secrets.SMTP_HOST }}
-      SMTP_PORT: ${{ secrets.SMTP_PORT }}
-      SMTP_USER: ${{ secrets.SMTP_USER }}
-      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      # ✅ 파일/상태 점검용
+      DEBUG_STATUS: 1
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # 혹시 requirements.txt에 없을 때를 대비(안전)
-          pip install requests yfinance
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
-      # ✅ 텔레그램 스모크 테스트 (이 단계에서 400/403/200 로그로 바로 판별)
-      - name: Telegram smoke test
-        env:
-          TELEGRAM_TOKEN: ${{ env.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ env.TELEGRAM_CHAT_ID }}
+      # ✅ (핵심) US/JP/KR 각각 텔레그램 테스트
+      - name: Telegram smoke test (US/JP/KR)
         run: |
           python - <<'PY'
-          import os, requests
-          token=os.environ.get("TELEGRAM_TOKEN","").strip()
-          chat=os.environ.get("TELEGRAM_CHAT_ID","").strip()
-
-          if not token or not chat:
-              raise SystemExit("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID in Secrets (TELEGRAM_* or TG_* 둘 중 하나는 있어야 함)")
-
+          import os, requests, datetime
+          token=os.getenv("TG_BOT_TOKEN","").strip()
+          chats={
+            "US": os.getenv("TG_CHAT_ID_US","").strip(),
+            "JP": os.getenv("TG_CHAT_ID_JP","").strip(),
+            "KR": os.getenv("TG_CHAT_ID_KR","").strip(),
+          }
+          if not token:
+              raise SystemExit("❌ TG_BOT_TOKEN missing")
           url=f"https://api.telegram.org/bot{token}/sendMessage"
-          r=requests.post(url, data={"chat_id": chat, "text": "✅ Telegram test from GitHub Actions"}, timeout=20)
-          print("status:", r.status_code)
-          print((r.text or "")[:300])
-          r.raise_for_status()
+          now=datetime.datetime.now().strftime("%H:%M:%S")
+          for k, chat in chats.items():
+              if not chat:
+                  print(f"[{k}] ❌ chat_id missing")
+                  continue
+              r=requests.post(url, data={"chat_id":chat, "text":f"✅ Telegram test ({k}) from GitHub Actions @ {now}"}, timeout=15)
+              print(f"[{k}] status:", r.status_code, (r.text or "")[:200])
+          PY
+
+      # ✅ 티커 파일 존재/개수 확인 (이거로 KR/JP가 비어있는지 1초컷)
+      - name: Check ticker files
+        run: |
+          python - <<'PY'
+          import os
+          for fn in ["tickers_us.txt","tickers_jp.txt","tickers_kr.txt"]:
+              if not os.path.exists(fn):
+                  print(f"{fn}: MISSING")
+                  continue
+              with open(fn,"r",encoding="utf-8") as f:
+                  lines=[ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+              print(f"{fn}: {len(lines)} tickers (sample: {lines[:5]})")
           PY
 
       - name: Run radar
