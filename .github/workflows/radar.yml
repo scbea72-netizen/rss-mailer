@@ -2,8 +2,11 @@ name: Stock Radar (US/JP)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 30분마다
+    - cron: "*/30 * * * *"
   workflow_dispatch:
+
+permissions:
+  contents: write   # ✅ state.json 커밋하려면 필수
 
 jobs:
   run:
@@ -27,7 +30,16 @@ jobs:
           TG_CHAT_ID_JP: ${{ secrets.TG_CHAT_ID_JP }}
           VOL_MULT: "2.0"
           MIN_CHANGE_PCT: "0"
-          PERIOD: "6mo"
           INTERVAL: "1d"
+          PERIOD: "6mo"
+          SEND_TEST: "0"
         run: |
           python radar.py
+
+      - name: Commit state.json
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add state.json || true
+          git commit -m "Update radar state" || true
+          git push || true
