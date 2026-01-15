@@ -1,6 +1,6 @@
 name: Stock Radar (US/JP/KR)
 
-"on":
+on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
@@ -12,17 +12,34 @@ jobs:
   radar:
     runs-on: ubuntu-latest
 
+    # ✅ 핵심: Secrets 이름이 TELEGRAM_* 이든 TG_* 이든 자동으로 잡히게 함
+    # - TELEGRAM_TOKEN  : secrets.TELEGRAM_TOKEN 우선, 없으면 secrets.TG_BOT_TOKEN
+    # - TELEGRAM_CHAT_ID: secrets.TELEGRAM_CHAT_ID 우선, 없으면 secrets.TG_CHAT_ID, 없으면 secrets.TG_CHAT_ID_US
+    #
+    # ✅ 그리고 레거시 호환을 위해 TG_BOT_TOKEN / TG_CHAT_ID 도 같이 세팅
     env:
+      # ===== Telegram (new) =====
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN || secrets.TG_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || secrets.TG_CHAT_ID || secrets.TG_CHAT_ID_US }}
+
+      # ===== Telegram (legacy compatibility) =====
+      TG_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN || secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || secrets.TG_CHAT_ID || secrets.TG_CHAT_ID_US }}
+
+      # ===== Radar params =====
       MAX_TICKERS: 4000
       BATCH_SIZE: 200
+
+      # ✅ 등락률 기준(거래량 제거 버전에서 사용)
       PCT_MIN: 3.0
+      ABS_MODE: 0
+
+      # (선택) 메일 관련 쓰면 유지
       EMAIL_TO: ${{ secrets.EMAIL_TO }}
       SMTP_HOST: ${{ secrets.SMTP_HOST }}
       SMTP_PORT: ${{ secrets.SMTP_PORT }}
       SMTP_USER: ${{ secrets.SMTP_USER }}
       SMTP_PASS: ${{ secrets.SMTP_PASS }}
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout
@@ -36,23 +53,28 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # 혹시 requirements.txt에 없을 때를 대비(안전)
+          pip install requests yfinance
 
+      # ✅ 텔레그램 스모크 테스트 (이 단계에서 400/403/200 로그로 바로 판별)
       - name: Telegram smoke test
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOKEN: ${{ env.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ env.TELEGRAM_CHAT_ID }}
         run: |
           python - <<'PY'
           import os, requests
-          token=os.environ.get("TELEGRAM_TOKEN","")
-          chat=os.environ.get("TELEGRAM_CHAT_ID","")
+          token=os.environ.get("TELEGRAM_TOKEN","").strip()
+          chat=os.environ.get("TELEGRAM_CHAT_ID","").strip()
+
           if not token or not chat:
-              raise SystemExit("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID in Secrets")
+              raise SystemExit("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID in Secrets (TELEGRAM_* or TG_* 둘 중 하나는 있어야 함)")
+
           url=f"https://api.telegram.org/bot{token}/sendMessage"
           r=requests.post(url, data={"chat_id": chat, "text": "✅ Telegram test from GitHub Actions"}, timeout=20)
           print("status:", r.status_code)
-          print(r.text[:300])
+          print((r.text or "")[:300])
           r.raise_for_status()
           PY
 
