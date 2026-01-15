@@ -12,47 +12,47 @@ KST = timezone(timedelta(hours=9))
 # ===== ENV (필수) =====
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 
-# 채널(또는 그룹) 대상: 공개채널이면 @채널아이디 사용 권장
-# 예) TG_CHAT_ID_US="@us_ai_radar"
-#     TG_CHAT_ID_JP="@jp_ai_radar"
-TG_CHAT_ID_US = os.getenv("TG_CHAT_ID_US", "").strip()
-TG_CHAT_ID_JP = os.getenv("TG_CHAT_ID_JP", "").strip()
+# ✅ 호환: 둘 중 아무거나 들어와도 동작하게
+TG_CHAT_ID_US = (os.getenv("TG_CHAT_ID_US", "").strip()
+                 or os.getenv("TG_CHAT_ID", "").strip())
+TG_CHAT_ID_JP = (os.getenv("TG_CHAT_ID_JP", "").strip()
+                 or os.getenv("TG_CHAT_ID_JP_ALT", "").strip())
 
 # ===== ENV (옵션: 기준 튜닝) =====
-# 거래량 폭증 배수 (기본 2.0배)
-VOL_MULT = float(os.getenv("VOL_MULT", "2.0"))
-# 전일대비 상승률 최소(%) (기본 0% = 조건 없음)
-MIN_CHANGE_PCT = float(os.getenv("MIN_CHANGE_PCT", "0"))
-# 캔들 간격/기간 (기본 1d / 6mo)
+VOL_MULT = float(os.getenv("VOL_MULT", "2.0"))          # 거래량 폭증 배수
+MIN_CHANGE_PCT = float(os.getenv("MIN_CHANGE_PCT", "0"))# 전일대비 상승률 최소(%)
 INTERVAL = os.getenv("INTERVAL", "1d")
 PERIOD = os.getenv("PERIOD", "6mo")
 
-# ===== Universe (원하면 자유롭게 추가/삭제) =====
+# ✅ 무조건 테스트 메시지 보낼지 (기본 ON)
+SEND_TEST = os.getenv("SEND_TEST", "1").strip()         # "1"=보냄, "0"=안보냄
+
+# ===== Universe =====
 US_TICKERS = [
-    # AI/반도체/빅테크 중심 예시
     "NVDA", "AMD", "INTC", "TSM", "ASML",
     "MSFT", "AMZN", "GOOGL", "META", "AAPL",
     "AVGO", "MU", "QCOM", "AMAT", "LRCX"
 ]
 
 JP_TICKERS = [
-    # 일본 대표 예시 (원하면 추가)
     "7203.T",  # Toyota
     "6758.T",  # Sony
     "9984.T",  # SoftBank Group
     "8035.T",  # Tokyo Electron
     "6857.T",  # Advantest
     "9432.T",  # NTT
-    "6861.T",  # Keyence (예시)
+    "6861.T",  # Keyence
 ]
 
 # ===== Telegram =====
 def tg_send(chat_id: str, text: str):
+    """
+    실패 시 GitHub Actions 로그에 이유가 뜨도록 예외를 올립니다.
+    """
     if not TG_BOT_TOKEN:
         raise RuntimeError("TG_BOT_TOKEN이 비어있습니다 (GitHub Secrets 설정 필요).")
     if not chat_id:
-        # 채널 미설정이면 조용히 skip
-        return
+        raise RuntimeError("채널 chat_id가 비어있습니다 (예: @us_ai_radar).")
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {
@@ -61,22 +61,24 @@ def tg_send(chat_id: str, text: str):
         "disable_web_page_preview": True,
     }
 
-    # 간단 재시도(네트워크 순간 오류 대비)
+    # 간단 재시도
+    last_err = None
     for i in range(3):
         try:
-            r = requests.post(url, data=payload, timeout=20)
+            r = requests.post(url, data=payload, timeout=25)
             if r.status_code == 200:
                 return
-            # 429(Too Many Requests)면 조금 쉬었다 재시도
+            # 429면 대기 후 재시도
             if r.status_code == 429:
                 time.sleep(2 + i * 2)
                 continue
-            # 그 외는 에러 로그
-            raise RuntimeError(f"Telegram API error {r.status_code}: {r.text[:200]}")
+            last_err = f"Telegram API error {r.status_code}: {r.text[:300]}"
+            break
         except requests.RequestException as e:
-            if i == 2:
-                raise
+            last_err = f"Telegram request error: {repr(e)}"
             time.sleep(1 + i)
+
+    raise RuntimeError(last_err or "Telegram send failed (unknown error)")
 
 def safe_num(x):
     try:
@@ -88,7 +90,7 @@ def safe_num(x):
         return None
 
 # ===== Core Scan =====
-def scan_universe(tickers, label):
+def scan_universe(tickers):
     """
     조건:
     - (전일 종가 <= 전일 MA20) AND (금일 종가 > 금일 MA20) : 20일선 상향돌파
@@ -102,11 +104,9 @@ def scan_universe(tickers, label):
             if df is None or len(df) < 30:
                 continue
 
-            # 멀티인덱스 방지(간혹 yfinance가 컬럼 구조 다르게 주는 경우 대비)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = [c[0] for c in df.columns]
 
-            # 필요한 컬럼 체크
             if "Close" not in df.columns or "Volume" not in df.columns:
                 continue
 
@@ -144,46 +144,47 @@ def scan_universe(tickers, label):
                     "vol_mult": last_vol / last_vol20,
                 })
 
-            # 너무 빠르게 호출하면 가끔 막힐 수 있어 약간 쉼
-            time.sleep(0.2)
+            time.sleep(0.15)
 
         except Exception:
-            # 한 종목 실패해도 전체는 계속
             continue
 
-    # 변동률 큰 순 정렬
     hits.sort(key=lambda x: x["chg_pct"], reverse=True)
     return hits
 
-def format_message(title, hits):
+def format_hits(title, hits):
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    lines = [f"📡 {title}", f"🕒 {now}", ""]
     if not hits:
-        return ""
+        lines.append("- 조건 충족 종목: 없음")
+        return "\n".join(lines)
 
-    lines = [f"🚨 {title}", f"🕒 {now}", ""]
-    for h in hits:
-        # 가격 소수점: 미국은 보통 소수, 일본은 엔 단위지만 그냥 2자리로 통일
+    for h in hits[:25]:
         lines.append(
-            f"- {h['ticker']} | +{h['chg_pct']:.2f}% | 종가 {h['close']:.2f} | 거래량 {h['vol_mult']:.1f}x"
+            f"- {h['ticker']} | {h['chg_pct']:+.2f}% | 종가 {h['close']:.2f} | 거래량 {h['vol_mult']:.1f}x"
         )
     return "\n".join(lines)
 
 def main():
-    # 미국
-    us_hits = scan_universe(US_TICKERS, "US")
-    us_msg = format_message("미국 20일선 돌파 + 거래량 폭증", us_hits)
-    if us_msg:
-        tg_send(TG_CHAT_ID_US, us_msg)
+    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
-    # 일본
-    jp_hits = scan_universe(JP_TICKERS, "JP")
-    jp_msg = format_message("일본 20일선 돌파 + 거래량 폭증", jp_hits)
-    if jp_msg:
-        tg_send(TG_CHAT_ID_JP, jp_msg)
+    # ✅ 1) 먼저 테스트 메시지(연결 확인용) — 기본 ON
+    if SEND_TEST == "1":
+        if TG_CHAT_ID_US:
+            tg_send(TG_CHAT_ID_US, f"✅ 레이더 테스트 발송 성공 (US) - {now}")
+        if TG_CHAT_ID_JP:
+            tg_send(TG_CHAT_ID_JP, f"✅ 레이더 테스트 발송 성공 (JP) - {now}")
 
-    # Actions 로그용
-    print("US hits:", len(us_hits), "JP hits:", len(jp_hits))
+    # ✅ 2) 종목 결과는 '없음'이어도 항상 메시지 발송
+    if TG_CHAT_ID_US:
+        us_hits = scan_universe(US_TICKERS)
+        tg_send(TG_CHAT_ID_US, format_hits(f"미국 20일선 돌파 + 거래량 {VOL_MULT:.1f}x", us_hits))
+
+    if TG_CHAT_ID_JP:
+        jp_hits = scan_universe(JP_TICKERS)
+        tg_send(TG_CHAT_ID_JP, format_hits(f"일본 20일선 돌파 + 거래량 {VOL_MULT:.1f}x", jp_hits))
+
+    print("DONE")
 
 if __name__ == "__main__":
     main()
-
