@@ -29,7 +29,7 @@ jobs:
           TG_CHAT_ID_US: ${{ secrets.TG_CHAT_ID_US }}
           TG_CHAT_ID_JP: ${{ secrets.TG_CHAT_ID_JP }}
           VOL_MULT: "1.5"
-          RSI_MIN: "55"
+          RSI_MIN: "50"
           SEND_EMPTY: "1"
           SEND_TEST: "0"
         run: |
