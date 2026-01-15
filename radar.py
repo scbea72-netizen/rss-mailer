@@ -42,6 +42,10 @@ KR_TICKERS_FILE = "tickers_kr.txt"
 
 STATE_FILE = "state.json"
 
+# ✅ 기업명 캐시(없으면 자동 생성/누적)
+TICKER_NAMES_FILE = "ticker_names.json"
+TICKER_NAME_MAX_FETCH = int(os.getenv("TICKER_NAME_MAX_FETCH", "300"))  # 한 번 실행당 신규 조회 상한(안정용)
+
 
 def tg_send(chat_id: str, text: str) -> None:
     if not TG_BOT_TOKEN:
@@ -215,6 +219,79 @@ def pct_change(last_price: float, base_price: float) -> Optional[float]:
     return (last_price / base_price - 1.0) * 100.0
 
 
+# ---------------------------
+# ✅ 기업명 캐시 로딩/저장
+# ---------------------------
+def load_ticker_names() -> Dict[str, str]:
+    if not os.path.exists(TICKER_NAMES_FILE):
+        return {}
+    try:
+        with open(TICKER_NAMES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                # value는 문자열만
+                return {k: str(v) for k, v in data.items() if v}
+    except Exception:
+        pass
+    return {}
+
+
+def save_ticker_names(names: Dict[str, str]) -> None:
+    try:
+        with open(TICKER_NAMES_FILE, "w", encoding="utf-8") as f:
+            json.dump(names, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def fetch_name_yf(ticker: str) -> Optional[str]:
+    """
+    yfinance에서 기업명 가져오기(가끔 느리거나 실패 가능)
+    """
+    try:
+        info = yf.Ticker(ticker).info or {}
+        name = info.get("shortName") or info.get("longName") or info.get("displayName")
+        if name:
+            name = str(name).strip()
+            if len(name) > 60:
+                name = name[:60] + "…"
+            return name
+    except Exception:
+        return None
+    return None
+
+
+def ensure_names_for(tickers: List[str], names_cache: Dict[str, str]) -> Dict[str, str]:
+    """
+    캐시에 없는 티커만 일부(상한) 조회해서 저장
+    """
+    missing = [t for t in tickers if t not in names_cache]
+    if not missing:
+        return names_cache
+
+    to_fetch = missing[:TICKER_NAME_MAX_FETCH]
+    added = 0
+    for t in to_fetch:
+        nm = fetch_name_yf(t)
+        if nm:
+            names_cache[t] = nm
+            added += 1
+        # 너무 빠른 호출 방지
+        time.sleep(0.05)
+
+    if added > 0:
+        save_ticker_names(names_cache)
+        print(f"[NAME] added {added} names (cache size={len(names_cache)})")
+    return names_cache
+
+
+def get_display_name(ticker: str, names_cache: Dict[str, str]) -> str:
+    nm = names_cache.get(ticker, "")
+    if not nm:
+        return ticker
+    return f"{ticker} ({nm})"
+
+
 def scan_pct(
     tickers: List[str],
     market: str,
@@ -224,7 +301,10 @@ def scan_pct(
     ✅ 시장 열림: (마지막 5m close / 전일종가 - 1)*100
     ✅ 시장 닫힘: (오늘 종가 / 전일종가 - 1)*100 (일봉)
     """
-    tickers = tickers[:MAX_TICKERS]
+    # MAX_TICKERS=0 이면 전체
+    if MAX_TICKERS and MAX_TICKERS > 0:
+        tickers = tickers[:MAX_TICKERS]
+
     hits: List[Dict] = []
 
     interval = INTRADAY_INTERVAL if market_open else DAILY_INTERVAL
@@ -290,7 +370,7 @@ def scan_pct(
     return hits
 
 
-def format_msg(title: str, interval: str, hits: List[Dict]) -> str:
+def format_msg(title: str, interval: str, hits: List[Dict], names_cache: Dict[str, str]) -> str:
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
     cond = f"|pct|≥{PCT_MIN:.1f}%" if ABS_MODE == "1" else f"+{PCT_MIN:.1f}% 이상"
     lines = [f"📈 {title}", f"⏱ {interval} | KST {now}", f"✅ 조건: 등락률 {cond}", ""]
@@ -300,14 +380,22 @@ def format_msg(title: str, interval: str, hits: List[Dict]) -> str:
 
     for h in hits[:15]:
         sign = "+" if h["pct"] >= 0 else ""
-        lines.append(f"- {h['ticker']}  {sign}{h['pct']:.2f}%  (가격 {h['price']:.2f})")
+        disp = get_display_name(h["ticker"], names_cache)
+        lines.append(f"- {disp}  {sign}{h['pct']:.2f}%  (가격 {h['price']:.2f})")
         for nt in h.get("news", [])[:2]:
             lines.append(f"   • {nt}")
         lines.append("")
     return "\n".join(lines).strip()
 
 
-def dedup_and_send(market: str, chat_id: str, interval: str, title: str, hits: List[Dict]) -> None:
+def dedup_and_send(
+    market: str,
+    chat_id: str,
+    interval: str,
+    title: str,
+    hits: List[Dict],
+    names_cache: Dict[str, str]
+) -> None:
     state = load_state()
     sent = state.setdefault("sent", {})
 
@@ -320,7 +408,7 @@ def dedup_and_send(market: str, chat_id: str, interval: str, title: str, hits: L
         new_hits.append(h)
 
     if new_hits:
-        tg_send(chat_id, format_msg(title, interval, new_hits))
+        tg_send(chat_id, format_msg(title, interval, new_hits, names_cache))
 
     save_state(state)
 
@@ -330,13 +418,25 @@ def main():
     jp = load_tickers(JP_TICKERS_FILE)
     kr = load_tickers(KR_TICKERS_FILE)
 
+    # ✅ 기업명 캐시 로드 + (상한 내에서) 미등록 종목 이름 추가
+    names_cache = load_ticker_names()
+
+    # 전종목이면 한 번에 다 조회하면 느리니:
+    # 1) 우선 US/JP/KR 티커를 합치고
+    # 2) 최대 TICKER_NAME_MAX_FETCH개만 신규 조회
+    all_tickers = []
+    if us: all_tickers.extend(us)
+    if jp: all_tickers.extend(jp)
+    if kr: all_tickers.extend(kr)
+    names_cache = ensure_names_for(all_tickers, names_cache)
+
     # 🇺🇸 US
     if TG_CHAT_ID_US and us:
         open_ = is_us_market_open()
         hits = scan_pct(us, "US", market_open=open_)
         interval = INTRADAY_INTERVAL if open_ else DAILY_INTERVAL
         title = "미국(장중) 등락률 레이더" if open_ else "미국(일봉) 등락률 레이더"
-        dedup_and_send("US", TG_CHAT_ID_US, interval, title, hits)
+        dedup_and_send("US", TG_CHAT_ID_US, interval, title, hits, names_cache)
 
     # 🇯🇵 JP
     if TG_CHAT_ID_JP and jp:
@@ -344,7 +444,7 @@ def main():
         hits = scan_pct(jp, "JP", market_open=open_)
         interval = INTRADAY_INTERVAL if open_ else DAILY_INTERVAL
         title = "일본(장중) 등락률 레이더" if open_ else "일본(일봉) 등락률 레이더"
-        dedup_and_send("JP", TG_CHAT_ID_JP, interval, title, hits)
+        dedup_and_send("JP", TG_CHAT_ID_JP, interval, title, hits, names_cache)
 
     # 🇰🇷 KR
     if TG_CHAT_ID_KR:
@@ -355,7 +455,7 @@ def main():
             hits = scan_pct(kr, "KR", market_open=open_)
             interval = INTRADAY_INTERVAL if open_ else DAILY_INTERVAL
             title = "한국(장중) 등락률 레이더" if open_ else "한국(일봉) 등락률 레이더"
-            dedup_and_send("KR", TG_CHAT_ID_KR, interval, title, hits)
+            dedup_and_send("KR", TG_CHAT_ID_KR, interval, title, hits, names_cache)
 
     print("DONE")
 
