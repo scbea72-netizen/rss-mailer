@@ -12,9 +12,11 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -23,11 +25,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 🇰🇷 KOSPI + KOSDAQ 전체 티커 자동 갱신
       - name: Update KR tickers (KOSPI+KOSDAQ)
         run: |
           python update_tickers_kr.py
+          echo "tickers_kr.txt lines:"
+          wc -l tickers_kr.txt || true
+          head -n 5 tickers_kr.txt || true
 
+      # ✅ KR 채팅 ID 시크릿이 비었는지 즉시 확인 (비어있으면 여기서 실패시킴)
+      - name: Check Telegram secrets (KR)
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID_KR: ${{ secrets.TG_CHAT_ID_KR }}
+        run: |
+          if [ -z "$TG_BOT_TOKEN" ]; then
+            echo "ERROR: TG_BOT_TOKEN is empty"
+            exit 1
+          fi
+          if [ -z "$TG_CHAT_ID_KR" ]; then
+            echo "ERROR: TG_CHAT_ID_KR is empty (한국 채널/그룹 chat_id 시크릿 넣어야 함)"
+            exit 1
+          fi
+          echo "OK: TG_CHAT_ID_KR is set (length=${#TG_CHAT_ID_KR})"
+
+      # ✅ 한국 메시지 안 오는 문제 잡기용: 테스트 메시지 강제 발송 ON
       - name: Run radar
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -37,7 +58,7 @@ jobs:
           VOL_MULT: "1.5"
           RSI_MIN: "50"
           SEND_EMPTY: "1"
-          SEND_TEST: "0"
+          SEND_TEST: "1"
         run: |
           python radar.py
 
@@ -48,3 +69,4 @@ jobs:
           git add state.json || true
           git commit -m "Update radar state" || true
           git push || true
+
