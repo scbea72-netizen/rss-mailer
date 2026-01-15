@@ -13,32 +13,47 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # ✅ Telegram (승찬님 시크릿 그대로)
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_ID_US: ${{ secrets.TG_CHAT_ID_US }}
       TG_CHAT_ID_JP: ${{ secrets.TG_CHAT_ID_JP }}
       TG_CHAT_ID_KR: ${{ secrets.TG_CHAT_ID_KR }}
 
+      # ✅ 등락률 레이더 파라미터
       PCT_MIN: 3.0
       ABS_MODE: 0
-      MAX_TICKERS: 4000
-      BATCH_SIZE: 200
 
-      # ✅ 파일/상태 점검용
+      # ✅ 스캔 파라미터 (전종목이면 BATCH_SIZE 너무 크게 잡지 마세요)
+      MAX_TICKERS: 0
+      BATCH_SIZE: 80
+      RETRY: 2
+      SLEEP_BETWEEN_BATCH: 0.4
+
+      # ✅ (선택) 한국 티커에 KONEX 포함하려면 1
+      INCLUDE_KONEX: 0
+      KR_TICKERS_OUT: tickers_kr.txt
+
+      # ✅ (선택) 상태점검 메시지/로그용
       DEBUG_STATUS: 1
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
+          # 레이더 기본 의존성
           pip install -r requirements.txt
+          # 티커 자동 생성용 (KRX 전종목)
+          pip install finance-datareader
 
-      # ✅ (핵심) US/JP/KR 각각 텔레그램 테스트
+      # ✅ 1) 텔레그램 연결 테스트 (US/JP/KR 각각)
       - name: Telegram smoke test (US/JP/KR)
         run: |
           python - <<'PY'
@@ -57,11 +72,17 @@ jobs:
               if not chat:
                   print(f"[{k}] ❌ chat_id missing")
                   continue
-              r=requests.post(url, data={"chat_id":chat, "text":f"✅ Telegram test ({k}) from GitHub Actions @ {now}"}, timeout=15)
+              r=requests.post(url, data={"chat_id":chat, "text":f"✅ Telegram test ({k}) @ {now}"}, timeout=15)
               print(f"[{k}] status:", r.status_code, (r.text or "")[:200])
           PY
 
-      # ✅ 티커 파일 존재/개수 확인 (이거로 KR/JP가 비어있는지 1초컷)
+      # ✅ 2) 한국 코스피+코스닥 전종목 티커 자동 생성
+      #    (tools/gen_tickers_kr.py 파일이 repo에 있어야 함)
+      - name: Build KR tickers (KOSPI+KOSDAQ full)
+        run: |
+          python tools/gen_tickers_kr.py
+
+      # ✅ 3) 티커 파일 존재/개수 점검 (문제 생기면 여기서 바로 보임)
       - name: Check ticker files
         run: |
           python - <<'PY'
@@ -75,5 +96,7 @@ jobs:
               print(f"{fn}: {len(lines)} tickers (sample: {lines[:5]})")
           PY
 
+      # ✅ 4) 레이더 실행
       - name: Run radar
         run: python radar.py
+
