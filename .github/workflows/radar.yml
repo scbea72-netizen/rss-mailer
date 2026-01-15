@@ -20,7 +20,7 @@ jobs:
       TG_CHAT_ID_KR: ${{ secrets.TG_CHAT_ID_KR }}
 
       # ✅ 등락률 레이더 파라미터
-      PCT_MIN: 3.0
+      PCT_MIN: 0.3
       ABS_MODE: 0
 
       # ✅ 스캔 파라미터 (전종목이면 BATCH_SIZE 너무 크게 잡지 마세요)
