@@ -22,7 +22,7 @@ jobs:
 
       - name: Install deps
         run: |
-         python -m pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -c "import pykrx; print('pykrx OK')"
 
@@ -33,47 +33,20 @@ jobs:
           wc -l tickers_kr.txt || true
           head -n 5 tickers_kr.txt || true
 
-      # ✅ KR 채팅 ID 시크릿이 비었는지 즉시 확인 (비어있으면 여기서 실패시킴)
-      - name: Check Telegram secrets (KR)
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID_KR: ${{ secrets.TG_CHAT_ID_KR }}
-        run: |
-          if [ -z "$TG_BOT_TOKEN" ]; then
-            echo "ERROR: TG_BOT_TOKEN is empty"
-            exit 1
-          fi
-          if [ -z "$TG_CHAT_ID_KR" ]; then
-            echo "ERROR: TG_CHAT_ID_KR is empty (한국 채널/그룹 chat_id 시크릿 넣어야 함)"
-            exit 1
-          fi
-          echo "OK: TG_CHAT_ID_KR is set (length=${#TG_CHAT_ID_KR})"
-
-      # ✅ 한국 메시지 안 오는 문제 잡기용: 테스트 메시지 강제 발송 ON
-            - name: Run radar
+      - name: Run radar
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID_US: ${{ secrets.TG_CHAT_ID_US }}
           TG_CHAT_ID_JP: ${{ secrets.TG_CHAT_ID_JP }}
           TG_CHAT_ID_KR: ${{ secrets.TG_CHAT_ID_KR }}
-
-          # ✅ 무조건 상태리포트도 보내기(원인확정용)
-          DEBUG_STATUS: "1"
-
-          # ✅ 당분간 조건 완화(종목이 “진짜” 뜨게)
           VOL_MULT: "1.2"
           RSI_MIN: "45"
-
-          # ✅ 종목이 없어도 메시지 보내기
           SEND_EMPTY: "1"
           SEND_TEST: "0"
-
-          # ✅ 처음엔 일부만 스캔해서 빨리 확인
           MAX_TICKERS: "300"
           BATCH_SIZE: "150"
         run: |
           python radar.py
-
 
       - name: Commit state.json
         run: |
@@ -82,4 +55,3 @@ jobs:
           git add state.json || true
           git commit -m "Update radar state" || true
           git push || true
-
