@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # ✅ state.json 커밋하려면 필수
+  contents: write
 
 jobs:
   run:
@@ -28,10 +28,9 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID_US: ${{ secrets.TG_CHAT_ID_US }}
           TG_CHAT_ID_JP: ${{ secrets.TG_CHAT_ID_JP }}
-          VOL_MULT: "2.0"
-          MIN_CHANGE_PCT: "0"
-          INTERVAL: "1d"
-          PERIOD: "6mo"
+          VOL_MULT: "3.0"
+          RSI_MIN: "55"
+          SEND_EMPTY: "1"
           SEND_TEST: "0"
         run: |
           python radar.py
