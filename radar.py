@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import json
 import requests
 import yfinance as yf
 import pandas as pd
@@ -19,36 +20,23 @@ TG_CHAT_ID_JP = (os.getenv("TG_CHAT_ID_JP", "").strip()
                  or os.getenv("TG_CHAT_ID_JP_ALT", "").strip())
 
 # ===== ENV (옵션: 기준 튜닝) =====
-VOL_MULT = float(os.getenv("VOL_MULT", "2.0"))          # 거래량 폭증 배수
-MIN_CHANGE_PCT = float(os.getenv("MIN_CHANGE_PCT", "0"))# 전일대비 상승률 최소(%)
+VOL_MULT = float(os.getenv("VOL_MULT", "2.0"))           # 거래량 폭증 배수
+MIN_CHANGE_PCT = float(os.getenv("MIN_CHANGE_PCT", "0")) # 전일대비 상승률 최소(%)
 INTERVAL = os.getenv("INTERVAL", "1d")
 PERIOD = os.getenv("PERIOD", "6mo")
 
-# ✅ 무조건 테스트 메시지 보낼지 (기본 ON)
-SEND_TEST = os.getenv("SEND_TEST", "1").strip()         # "1"=보냄, "0"=안보냄
+# ✅ 테스트 메시지(연결 확인용) (기본 OFF로 바꿈: 원하면 Actions env에서 "1"로 켜세요)
+SEND_TEST = os.getenv("SEND_TEST", "0").strip()          # "1"=보냄, "0"=안보냄
 
-# ===== Universe =====
-US_TICKERS = [
-    "NVDA", "AMD", "INTC", "TSM", "ASML",
-    "MSFT", "AMZN", "GOOGL", "META", "AAPL",
-    "AVGO", "MU", "QCOM", "AMAT", "LRCX"
-]
+# ===== Ticker file paths (레포 루트에 만들어둔 txt) =====
+US_TICKERS_FILE = "tickers_us.txt"
+JP_TICKERS_FILE = "tickers_jp.txt"
 
-JP_TICKERS = [
-    "7203.T",  # Toyota
-    "6758.T",  # Sony
-    "9984.T",  # SoftBank Group
-    "8035.T",  # Tokyo Electron
-    "6857.T",  # Advantest
-    "9432.T",  # NTT
-    "6861.T",  # Keyence
-]
+# ===== Dedup state =====
+STATE_FILE = "state.json"  # 같은 신호 반복 알림 방지용 (워크플로우가 자동 커밋)
 
 # ===== Telegram =====
 def tg_send(chat_id: str, text: str):
-    """
-    실패 시 GitHub Actions 로그에 이유가 뜨도록 예외를 올립니다.
-    """
     if not TG_BOT_TOKEN:
         raise RuntimeError("TG_BOT_TOKEN이 비어있습니다 (GitHub Secrets 설정 필요).")
     if not chat_id:
@@ -61,14 +49,12 @@ def tg_send(chat_id: str, text: str):
         "disable_web_page_preview": True,
     }
 
-    # 간단 재시도
     last_err = None
     for i in range(3):
         try:
             r = requests.post(url, data=payload, timeout=25)
             if r.status_code == 200:
                 return
-            # 429면 대기 후 재시도
             if r.status_code == 429:
                 time.sleep(2 + i * 2)
                 continue
@@ -89,14 +75,36 @@ def safe_num(x):
     except Exception:
         return None
 
+def load_tickers(path: str):
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            t = line.strip()
+            if t and not t.startswith("#"):
+                out.append(t)
+    return out
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {"sent": {}}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"sent": {}}
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def sig_key(market: str, ticker: str, last_date_key: str):
+    # market + ticker + 마지막 캔들 날짜로 중복 방지
+    return f"{market}|{ticker}|{INTERVAL}|{last_date_key}"
+
 # ===== Core Scan =====
 def scan_universe(tickers):
-    """
-    조건:
-    - (전일 종가 <= 전일 MA20) AND (금일 종가 > 금일 MA20) : 20일선 상향돌파
-    - 금일 거래량 >= VOL_MULT * 금일 VOL20
-    - 금일 변동률 >= MIN_CHANGE_PCT
-    """
     hits = []
     for t in tickers:
         try:
@@ -142,10 +150,10 @@ def scan_universe(tickers):
                     "chg_pct": chg_pct,
                     "close": last_close,
                     "vol_mult": last_vol / last_vol20,
+                    "date_key": str(df.index[-1]),
                 })
 
-            time.sleep(0.15)
-
+            time.sleep(0.12)
         except Exception:
             continue
 
@@ -165,25 +173,52 @@ def format_hits(title, hits):
         )
     return "\n".join(lines)
 
+def filter_dedup(market: str, hits, state):
+    sent = state.setdefault("sent", {})
+    out = []
+    for h in hits:
+        k = sig_key(market, h["ticker"], h["date_key"])
+        if sent.get(k):
+            continue
+        sent[k] = True
+        out.append(h)
+    return out
+
 def main():
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
-    # ✅ 1) 먼저 테스트 메시지(연결 확인용) — 기본 ON
+    us_tickers = load_tickers(US_TICKERS_FILE)
+    jp_tickers = load_tickers(JP_TICKERS_FILE)
+
+    state = load_state()
+
+    # 1) 테스트 메시지 (원할 때만)
     if SEND_TEST == "1":
         if TG_CHAT_ID_US:
-            tg_send(TG_CHAT_ID_US, f"✅ 레이더 테스트 발송 성공 (US) - {now}")
+            tg_send(TG_CHAT_ID_US, f"✅ 업그레이드 레이더 테스트 (US) - {now}")
         if TG_CHAT_ID_JP:
-            tg_send(TG_CHAT_ID_JP, f"✅ 레이더 테스트 발송 성공 (JP) - {now}")
+            tg_send(TG_CHAT_ID_JP, f"✅ 업그레이드 레이더 테스트 (JP) - {now}")
 
-    # ✅ 2) 종목 결과는 '없음'이어도 항상 메시지 발송
+    # 2) 미국
     if TG_CHAT_ID_US:
-        us_hits = scan_universe(US_TICKERS)
-        tg_send(TG_CHAT_ID_US, format_hits(f"미국 20일선 돌파 + 거래량 {VOL_MULT:.1f}x", us_hits))
+        us_hits = scan_universe(us_tickers) if us_tickers else []
+        us_new = filter_dedup("US", us_hits, state)
+        # 종목이 없으면 '없음'은 보내고, 종목이 있는데 전부 중복이면 조용히(스팸 방지)
+        if not us_hits:
+            tg_send(TG_CHAT_ID_US, format_hits(f"미국 20일선 돌파 + 거래량 {VOL_MULT:.1f}x", []))
+        elif us_new:
+            tg_send(TG_CHAT_ID_US, format_hits(f"미국 20일선 돌파 + 거래량 {VOL_MULT:.1f}x", us_new))
 
+    # 3) 일본
     if TG_CHAT_ID_JP:
-        jp_hits = scan_universe(JP_TICKERS)
-        tg_send(TG_CHAT_ID_JP, format_hits(f"일본 20일선 돌파 + 거래량 {VOL_MULT:.1f}x", jp_hits))
+        jp_hits = scan_universe(jp_tickers) if jp_tickers else []
+        jp_new = filter_dedup("JP", jp_hits, state)
+        if not jp_hits:
+            tg_send(TG_CHAT_ID_JP, format_hits(f"일본 20일선 돌파 + 거래량 {VOL_MULT:.1f}x", []))
+        elif jp_new:
+            tg_send(TG_CHAT_ID_JP, format_hits(f"일본 20일선 돌파 + 거래량 {VOL_MULT:.1f}x", jp_new))
 
+    save_state(state)
     print("DONE")
 
 if __name__ == "__main__":
