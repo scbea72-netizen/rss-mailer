@@ -1,9 +1,8 @@
 feedparser==6.0.11
 requests==2.32.3
-beautifulsoup4
-python-dateutil
+beautifulsoup4==4.12.3
+python-dateutil==2.9.0.post0
 googletrans==4.0.0-rc1
-yfinance
-pandas
-requests
-feedparser
+yfinance==0.2.40
+pandas==2.2.2
+pykrx==1.0.50
