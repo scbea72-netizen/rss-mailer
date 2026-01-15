@@ -1,6 +1,6 @@
 name: Stock Radar (US/JP/KR)
 
-on:
+"on":
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
@@ -15,8 +15,7 @@ jobs:
     env:
       MAX_TICKERS: 4000
       BATCH_SIZE: 200
-      MIN_VOLUME_MULT: 1.5
-      RSI_MIN: 55
+      PCT_MIN: 3.0
       EMAIL_TO: ${{ secrets.EMAIL_TO }}
       SMTP_HOST: ${{ secrets.SMTP_HOST }}
       SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -36,7 +35,26 @@ jobs:
 
       - name: Install deps
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Telegram smoke test
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os, requests
+          token=os.environ.get("TELEGRAM_TOKEN","")
+          chat=os.environ.get("TELEGRAM_CHAT_ID","")
+          if not token or not chat:
+              raise SystemExit("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID in Secrets")
+          url=f"https://api.telegram.org/bot{token}/sendMessage"
+          r=requests.post(url, data={"chat_id": chat, "text": "✅ Telegram test from GitHub Actions"}, timeout=20)
+          print("status:", r.status_code)
+          print(r.text[:300])
+          r.raise_for_status()
+          PY
 
       - name: Run radar
         run: python radar.py
