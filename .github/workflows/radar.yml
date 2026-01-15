@@ -49,18 +49,30 @@ jobs:
           echo "OK: TG_CHAT_ID_KR is set (length=${#TG_CHAT_ID_KR})"
 
       # ✅ 한국 메시지 안 오는 문제 잡기용: 테스트 메시지 강제 발송 ON
-      - name: Run radar
+            - name: Run radar
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID_US: ${{ secrets.TG_CHAT_ID_US }}
           TG_CHAT_ID_JP: ${{ secrets.TG_CHAT_ID_JP }}
           TG_CHAT_ID_KR: ${{ secrets.TG_CHAT_ID_KR }}
+
+          # ✅ 무조건 상태리포트도 보내기(원인확정용)
+          DEBUG_STATUS: "1"
+
+          # ✅ 당분간 조건 완화(종목이 “진짜” 뜨게)
           VOL_MULT: "1.2"
           RSI_MIN: "45"
+
+          # ✅ 종목이 없어도 메시지 보내기
           SEND_EMPTY: "1"
           SEND_TEST: "0"
+
+          # ✅ 처음엔 일부만 스캔해서 빨리 확인
+          MAX_TICKERS: "300"
+          BATCH_SIZE: "150"
         run: |
           python radar.py
+
 
       - name: Commit state.json
         run: |
