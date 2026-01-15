@@ -28,7 +28,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID_US: ${{ secrets.TG_CHAT_ID_US }}
           TG_CHAT_ID_JP: ${{ secrets.TG_CHAT_ID_JP }}
-          VOL_MULT: "3.0"
+          VOL_MULT: "1.5"
           RSI_MIN: "55"
           SEND_EMPTY: "1"
           SEND_TEST: "0"
