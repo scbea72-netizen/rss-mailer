@@ -44,6 +44,8 @@ jobs:
           SEND_TEST: "0"
           MAX_TICKERS: "300"
           BATCH_SIZE: "150"
+          MAX_TICKERS: "300"
+          BATCH_SIZE: "150"
         run: |
           python radar.py
 
