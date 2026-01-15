@@ -3,3 +3,6 @@ requests==2.32.3
 beautifulsoup4
 python-dateutil
 googletrans==4.0.0-rc1
+yfinance
+pandas
+requests
