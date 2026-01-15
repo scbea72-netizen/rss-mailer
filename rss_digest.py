@@ -9,6 +9,11 @@ rss_digest.py
 - 미국/한국/일본(US/KR/JP) 3개 소스를 "한 통"의 메일로 합쳐서 발송
 - SMTP: SSL/STARTTLS 자동 재시도 (Secrets 확인 불가 상황도 대응)
 
+핵심 개선(일본 RSS 미수신 해결):
+- feedparser가 URL을 직접 파싱할 때 차단/실패하는 경우가 많아서,
+  requests로 먼저 가져오고(User-Agent 포함) 그 내용을 feedparser로 파싱하도록 변경
+- JP 피드를 안정적인 소스로 보강 (NHK/Reuters JP/Nikkei 등)
+
 Requirements:
   pip install requests feedparser python-dateutil googletrans==4.0.0rc1
 """
@@ -35,7 +40,27 @@ from googletrans import Translator
 
 
 # -----------------------------
-# 1) RSS FEEDS (코인 제거, 일본 추가)
+# 0) HTTP 기본 설정
+# -----------------------------
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
+USER_AGENT = os.getenv(
+    "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": USER_AGENT,
+    "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7,ja;q=0.6",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+})
+
+
+# -----------------------------
+# 1) RSS FEEDS (일본 안정 소스 보강)
 # -----------------------------
 # category: "US" | "KR" | "JP"
 FEEDS: List[Dict[str, str]] = [
@@ -50,7 +75,15 @@ FEEDS: List[Dict[str, str]] = [
     {"category": "KR", "name": "YNA - Economy", "url": "https://www.yna.co.kr/rss/economy.xml"},
     {"category": "KR", "name": "DART - Disclosures", "url": "https://opendart.fss.or.kr/api/rss.xml"},
 
-    # Japan
+    # Japan (안정/대체 소스 위주)
+    # NHK: 경제/비즈니스 성격이 섞인 뉴스 카테고리 RSS
+    {"category": "JP", "name": "NHK - Business", "url": "https://www3.nhk.or.jp/rss/news/cat5.xml"},
+    # Reuters Japan Business (지역/카테고리 피드가 동작하는 경우가 많음)
+    {"category": "JP", "name": "Reuters - Japan Business", "url": "https://feeds.reuters.com/reuters/JPbusinessNews"},
+    # Nikkei RSS (간혹 제한이 있을 수 있으나 RSS 자체는 꽤 안정적으로 동작)
+    {"category": "JP", "name": "Nikkei - Top", "url": "https://www.nikkei.com/rss/news/cat0.xml"},
+
+    # 기존 소스(가끔 차단/빈 피드가 되는 경우가 있어 유지하되, 위의 안정 소스가 메인)
     {"category": "JP", "name": "The Japan Times - Top Stories", "url": "https://www.japantimes.co.jp/feed/topstories/"},
     {"category": "JP", "name": "Nippon.com - News", "url": "https://www.nippon.com/en/news/feed/"},
     {"category": "JP", "name": "Digital Agency (Japan) - News", "url": "https://www.digital.go.jp/feed.xml"},
@@ -70,12 +103,12 @@ MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
 
 SUBJECT_PREFIX = os.getenv("SUBJECT_PREFIX", "[RSS]")
 MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "30"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "48"))
 
 CACHE_PATH = Path(os.getenv("CACHE_PATH", ".cache/rss/sent_cache.json"))
 CACHE_MAX_KEYS = int(os.getenv("CACHE_MAX_KEYS", "5000"))
 
+# 1이면 링크 최종 도착지로 해석(리다이렉트 추적). 기본은 0(빠르고 안전)
 RESOLVE_FINAL_URL = os.getenv("RESOLVE_FINAL_URL", "0").strip().lower() in ("1", "true", "yes")
 
 
@@ -103,10 +136,9 @@ def resolve_final_url(url: str) -> str:
     if not RESOLVE_FINAL_URL:
         return url
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; RSSDigest/1.0)"}
-        r = requests.head(url, allow_redirects=True, timeout=REQUEST_TIMEOUT, headers=headers)
+        r = SESSION.head(url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
         if r.status_code >= 400 or not r.url:
-            r = requests.get(url, allow_redirects=True, timeout=REQUEST_TIMEOUT, headers=headers)
+            r = SESSION.get(url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
         return r.url or url
     except Exception:
         return url
@@ -156,12 +188,32 @@ def make_key(category: str, feed_name: str, title: str, link: str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def fetch_feed_content(url: str) -> bytes:
+    """
+    일본 RSS가 안 들어오는 대표 원인:
+    - feedparser.parse(url)이 내부적으로 User-Agent 없이 접근하거나,
+      사이트가 봇 접근을 막아서 entries가 비어버림
+    해결:
+    - requests로 먼저 content를 받아 feedparser에 bytes로 넘김
+    """
+    r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.content
+
+
 def fetch_feed_items(feed: Dict[str, str]) -> List[Dict[str, Any]]:
     url = feed["url"]
     if is_biztoc_url(url):
         return []
 
-    parsed = feedparser.parse(url)
+    # 1) content 먼저 가져오기(차단 회피/호환성 향상)
+    try:
+        content = fetch_feed_content(url)
+        parsed = feedparser.parse(content)
+    except Exception:
+        # 2) 그래도 실패하면 feedparser URL 파싱으로 한 번 더(예비)
+        parsed = feedparser.parse(url)
+
     items: List[Dict[str, Any]] = []
 
     for entry in parsed.entries[:MAX_ITEMS_PER_FEED]:
@@ -351,7 +403,7 @@ def main() -> int:
             items = filter_recent(fetch_feed_items(feed))
             all_items.extend(items)
         except Exception:
-            print(f"[WARN] feed failed: {feed.get('name')} ({feed.get('url')})")
+            print(f"[WARN] feed failed: {feed.get('category')} | {feed.get('name')} ({feed.get('url')})")
             traceback.print_exc()
 
     fresh: List[Dict[str, Any]] = []
@@ -382,3 +434,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
