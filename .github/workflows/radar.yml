@@ -1,20 +1,33 @@
-name: AI Stock Radar
+name: Stock Radar (US/JP)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/30 * * * *"   # 30분마다
   workflow_dispatch:
 
 jobs:
-  radar:
+  run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install yfinance pandas numpy requests
-      - run: python radar.py
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run radar
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_CHAT_ID_US: ${{ secrets.TG_CHAT_ID_US }}
+          TG_CHAT_ID_JP: ${{ secrets.TG_CHAT_ID_JP }}
+          VOL_MULT: "2.0"
+          MIN_CHANGE_PCT: "0"
+          PERIOD: "6mo"
+          INTERVAL: "1d"
+        run: |
+          python radar.py
