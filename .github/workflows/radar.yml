@@ -29,8 +29,8 @@ jobs:
         run: |
           python update_tickers_kr.py
           echo "tickers_kr.txt lines:"
-          wc -l tickers_kr.txt || true
-          head -n 5 tickers_kr.txt || true
+          wc -l tickers_kr.txt
+          head -n 10 tickers_kr.txt
 
       - name: Run radar
         env:
