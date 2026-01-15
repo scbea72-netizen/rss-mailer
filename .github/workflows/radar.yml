@@ -55,10 +55,10 @@ jobs:
           TG_CHAT_ID_US: ${{ secrets.TG_CHAT_ID_US }}
           TG_CHAT_ID_JP: ${{ secrets.TG_CHAT_ID_JP }}
           TG_CHAT_ID_KR: ${{ secrets.TG_CHAT_ID_KR }}
-          VOL_MULT: "1.5"
-          RSI_MIN: "50"
+          VOL_MULT: "1.2"
+          RSI_MIN: "45"
           SEND_EMPTY: "1"
-          SEND_TEST: "1"
+          SEND_TEST: "0"
         run: |
           python radar.py
 
