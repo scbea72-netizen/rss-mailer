@@ -271,6 +271,20 @@ def main():
     us_tickers = load_tickers(US_TICKERS_FILE)
     jp_tickers = load_tickers(JP_TICKERS_FILE)
     kr_tickers = load_tickers(KR_TICKERS_FILE)
+    # ✅ 디버그 상태 리포트(스캔이 도는지, 티커가 비었는지 바로 확인)
+    if os.getenv("DEBUG_STATUS", "0") == "1" and TG_CHAT_ID_KR:
+        msg = (
+            "📌 [KR 상태 리포트]\n"
+            f"- tickers_kr.txt 개수: {len(kr_tickers)}\n"
+            f"- MAX_TICKERS: {MAX_TICKERS}\n"
+            f"- BATCH_SIZE: {BATCH_SIZE}\n"
+            f"- VOL_MULT: {VOL_MULT}\n"
+            f"- RSI_MIN: {RSI_MIN}\n"
+        )
+        # 앞 5개 티커도 같이 보여주기
+        if kr_tickers:
+            msg += "- 예시 티커(앞 5개): " + ", ".join(kr_tickers[:5])
+        tg_send(TG_CHAT_ID_KR, msg)
 
     # ✅ 테스트
     if SEND_TEST == "1":
