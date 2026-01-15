@@ -1,4 +1,4 @@
-name: Stock Radar (US/JP)
+name: Stock Radar (US/JP/KR)
 
 on:
   schedule:
@@ -23,11 +23,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 🇰🇷 KOSPI + KOSDAQ 전체 티커 자동 갱신
+      - name: Update KR tickers (KOSPI+KOSDAQ)
+        run: |
+          python update_tickers_kr.py
+
       - name: Run radar
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID_US: ${{ secrets.TG_CHAT_ID_US }}
           TG_CHAT_ID_JP: ${{ secrets.TG_CHAT_ID_JP }}
+          TG_CHAT_ID_KR: ${{ secrets.TG_CHAT_ID_KR }}
           VOL_MULT: "1.5"
           RSI_MIN: "50"
           SEND_EMPTY: "1"
