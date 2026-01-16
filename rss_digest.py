@@ -2,12 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-rss_digest.py (무료·안정 / 제목만 한글 처리)
+rss_digest.py (뉴스 메일러)
 
-동작 규칙
+요구사항:
 - KR(한국): 제목 그대로
-- US/JP(미국/일본): 제목만 한글화(용어 치환 기반, 무료)
-- 본문은 원문 유지
+- US/JP(미국/일본): 제목만 "진짜" 한글 번역 (무료 MyMemory)
+- 본문은 원문(링크만)
+- 번역 실패/제한 시: 원문 제목 그대로(메일 발송은 계속)
+- 캐시로 번역 호출 최소화
+- 45분 주기(워크플로에서 설정)에도 안정적으로 동작
+
+주의:
+- MyMemory는 무료라서 순간 호출이 많으면 번역이 원문으로 돌아올 수 있음(일시적).
+  그래도 캐시가 쌓이면 다음부터는 대부분 한글로 안정됨.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ import requests
 import feedparser
 from dateutil import parser as dtparser
 
+
 # -----------------------------
 # 0) Runtime knobs (ENV)
 # -----------------------------
@@ -44,7 +52,7 @@ USER_AGENT = os.getenv(
 MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "30"))
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "48"))
 
-# 배치 윈도우 기본 OFF
+# 기존 90초 필터로 기사 1~2개만 오는 문제 방지 (기본 OFF)
 BATCH_WINDOW_SECONDS = int(os.getenv("BATCH_WINDOW_SECONDS", "0"))
 
 # 한 통 최대 개수
@@ -56,7 +64,7 @@ MAX_KR = int(os.getenv("MAX_KR", "25"))
 MAX_JP = int(os.getenv("MAX_JP", "25"))
 
 # JP 키워드 필터 (원하면 OFF)
-JP_KEYWORD_MODE = os.getenv("JP_KEYWORD_MODE", "1").strip().lower() in ("1", "true", "yes")
+JP_KEYWORD_MODE = os.getenv("JP_KEYWORD_MODE", "0").strip().lower() in ("1", "true", "yes")
 JP_KEYWORDS = [k.strip() for k in os.getenv(
     "JP_KEYWORDS",
     "boj,bank of japan,yen,jpy,nikkei,tokyo stock,topix,fx,usd/jpy,semiconductor,hbm,chip,ai,robot,sony,toyota,softbank,tsmc,renesas,advantest,screen holdings,disco"
@@ -69,6 +77,13 @@ JP_EXCLUDE_KEYWORDS = [k.strip() for k in os.getenv(
 
 RESOLVE_FINAL_URL = os.getenv("RESOLVE_FINAL_URL", "0").strip().lower() in ("1", "true", "yes")
 
+# ✅ 제목 번역(진짜 번역) ON/OFF
+TITLE_TRANSLATE = os.getenv("TITLE_TRANSLATE", "1").strip().lower() in ("1", "true", "yes")
+TITLE_TRANSLATE_PROVIDER = os.getenv("TITLE_TRANSLATE_PROVIDER", "mymemory").strip().lower()
+
+# 번역 호출 속도 제한(무료 API 보호) - 기본 1초
+TRANSLATE_SLEEP_SECONDS = float(os.getenv("TRANSLATE_SLEEP_SECONDS", "1.0"))
+
 # -----------------------------
 # 1) HTTP Session
 # -----------------------------
@@ -80,6 +95,7 @@ SESSION.headers.update({
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
 })
+
 
 # -----------------------------
 # 2) Feeds
@@ -101,6 +117,7 @@ FEEDS: List[Dict[str, str]] = [
     {"category": "JP", "name": "Nikkei - Top", "url": "https://www.nikkei.com/rss/news/cat0.xml"},
 ]
 
+
 # -----------------------------
 # 3) SMTP / Mail
 # -----------------------------
@@ -109,7 +126,7 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 
-MAIL_TO   = os.getenv("MAIL_TO", SMTP_USER)
+MAIL_TO = os.getenv("MAIL_TO", SMTP_USER)
 MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
 
 SUBJECT_PREFIX = os.getenv("SUBJECT_PREFIX", "[RSS]")
@@ -117,8 +134,13 @@ SUBJECT_PREFIX = os.getenv("SUBJECT_PREFIX", "[RSS]")
 CACHE_PATH = Path(os.getenv("CACHE_PATH", ".cache/rss/sent_cache.json"))
 CACHE_MAX_KEYS = int(os.getenv("CACHE_MAX_KEYS", "5000"))
 
+# 번역 캐시(제목 -> 번역결과)
+TITLE_CACHE_PATH = Path(os.getenv("TITLE_CACHE_PATH", ".cache/rss/title_cache.json"))
+TITLE_CACHE_MAX = int(os.getenv("TITLE_CACHE_MAX", "5000"))
+
+
 # -----------------------------
-# 4) Helpers
+# 4) URL / Cache helpers
 # -----------------------------
 def canonicalize_url(url: str) -> str:
     try:
@@ -183,9 +205,48 @@ def save_cache(cache: Dict[str, float]) -> None:
         cache = dict(items[-CACHE_MAX_KEYS:])
     CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def load_title_cache() -> Dict[str, str]:
+    if TITLE_CACHE_PATH.exists():
+        try:
+            data = json.loads(TITLE_CACHE_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except Exception:
+            pass
+    return {}
+
+def save_title_cache(cache: Dict[str, str]) -> None:
+    TITLE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if len(cache) > TITLE_CACHE_MAX:
+        # 간단히 앞쪽 일부 제거(정교한 LRU 대신)
+        for k in list(cache.keys())[: len(cache) - TITLE_CACHE_MAX]:
+            cache.pop(k, None)
+    TITLE_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
 def make_key(category: str, feed_name: str, title: str, link: str) -> str:
     raw = f"{category}|{feed_name}|{title}|{link}".encode("utf-8", errors="ignore")
     return hashlib.sha256(raw).hexdigest()
+
+def filter_recent(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if MAX_AGE_HOURS <= 0:
+        return items
+    cutoff = datetime.now(timezone.utc).timestamp() - (MAX_AGE_HOURS * 3600)
+    return [it for it in items if not it.get("time") or it["time"].timestamp() >= cutoff]
+
+
+# -----------------------------
+# 5) Language detect / JP filter
+# -----------------------------
+def has_hangul(s: str) -> bool:
+    return any('가' <= ch <= '힣' for ch in s)
+
+def looks_japanese(s: str) -> bool:
+    # 히라가나/가타카나 + 일부 일본 특수 문자 범위
+    for ch in s:
+        o = ord(ch)
+        if (0x3040 <= o <= 0x30FF) or (0x31F0 <= o <= 0x31FF):
+            return True
+    return False
 
 def jp_keyword_pass(title: str) -> bool:
     if not JP_KEYWORD_MODE:
@@ -195,18 +256,10 @@ def jp_keyword_pass(title: str) -> bool:
         return False
     return any(k.lower() in t for k in JP_KEYWORDS)
 
-def filter_recent(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if MAX_AGE_HOURS <= 0:
-        return items
-    cutoff = datetime.now(timezone.utc).timestamp() - (MAX_AGE_HOURS * 3600)
-    return [it for it in items if not it.get("time") or it["time"].timestamp() >= cutoff]
 
 # -----------------------------
-# 5) 제목 한글화(무료, 용어 치환)
+# 6) Real title translation (MyMemory)
 # -----------------------------
-def has_hangul(s: str) -> bool:
-    return any('가' <= ch <= '힣' for ch in s)
-
 _GLOSSARY = [
     (re.compile(r"\bBOJ\b", re.I), "일본 중앙은행(BOJ)"),
     (re.compile(r"\bBank of Japan\b", re.I), "일본 중앙은행(BOJ)"),
@@ -222,32 +275,86 @@ _GLOSSARY = [
     (re.compile(r"\bGDP\b", re.I), "국내총생산(GDP)"),
 ]
 
-def polish_ko_title(t: str) -> str:
-    out = t
+def polish_terms_ko(text: str) -> str:
+    out = text
     for pat, rep in _GLOSSARY:
         out = pat.sub(rep, out)
-    return re.sub(r"\s+", " ", out).strip()
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
 
-def title_for_category(original: str, category: str) -> str:
+def translate_title_mymemory(text: str, src: str, dest: str = "ko") -> str:
+    """
+    무료 MyMemory 번역.
+    제한/실패 시 원문 반환.
+    """
+    try:
+        params = {"q": text, "langpair": f"{src}|{dest}"}
+        r = SESSION.get(
+            "https://api.mymemory.translated.net/get",
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        )
+        if r.status_code != 200:
+            return text
+        data = r.json()
+        out = (data.get("responseData", {}) or {}).get("translatedText")
+        if not out:
+            return text
+        out = str(out).strip()
+        if not out:
+            return text
+        return out
+    except Exception:
+        return text
+
+def translate_title_if_needed(title: str, category: str, title_cache: Dict[str, str]) -> str:
     """
     KR: 그대로
-    US/JP: 제목만 한글화(용어 치환)
+    US/JP: 제목만 한글 번역 (MyMemory) + 용어 후처리
+    번역 실패/제한: 원문 반환 (메일은 정상 발송)
     """
-    t = (original or "").strip()
+    t = (title or "").strip()
     if not t:
         return t
 
     if category == "KR":
         return t
 
-    # 이미 한글이 있으면 다듬기만
+    # 이미 한글이면 용어 다듬기만
     if has_hangul(t):
-        return polish_ko_title(t)
+        return polish_terms_ko(t)
 
-    return polish_ko_title(t)
+    if not TITLE_TRANSLATE:
+        # 번역 OFF일 때도 가독성용 용어 치환만
+        return polish_terms_ko(t)
+
+    # 언어 추정: 일본어 문자 있으면 ja, 아니면 en
+    src = "ja" if looks_japanese(t) else "en"
+    ck = f"{src}|ko|{t}"
+    if ck in title_cache:
+        return title_cache[ck]
+
+    translated = t
+    if TITLE_TRANSLATE_PROVIDER == "mymemory":
+        translated = translate_title_mymemory(t, src, "ko")
+        # 무료 번역 품질/표기 보정
+        translated = polish_terms_ko(translated)
+    else:
+        # provider 확장 여지
+        translated = polish_terms_ko(t)
+
+    # 번역이 실패해서 원문이 그대로면, 그대로 캐시해도 OK(중복 호출 방지)
+    title_cache[ck] = translated
+
+    # 무료 API 보호: 요청 간격
+    if TRANSLATE_SLEEP_SECONDS > 0:
+        time.sleep(TRANSLATE_SLEEP_SECONDS)
+
+    return translated
+
 
 # -----------------------------
-# 6) Fetch feed items
+# 7) Fetch feed items
 # -----------------------------
 def fetch_feed_items(feed: Dict[str, str]) -> List[Dict[str, Any]]:
     try:
@@ -259,11 +366,12 @@ def fetch_feed_items(feed: Dict[str, str]) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     for entry in parsed.entries[:MAX_ITEMS_PER_FEED]:
         title = (entry.get("title") or "").strip()
-        link  = (entry.get("link") or "").strip()
+        link = (entry.get("link") or "").strip()
         if not title or not link:
             continue
         if feed["category"] == "JP" and not jp_keyword_pass(title):
             continue
+
         items.append({
             "category": feed["category"],
             "feed": feed["name"],
@@ -273,8 +381,9 @@ def fetch_feed_items(feed: Dict[str, str]) -> List[Dict[str, Any]]:
         })
     return items
 
+
 # -----------------------------
-# 7) Email HTML
+# 8) Email HTML
 # -----------------------------
 CATEGORY_SUBJECT = {"US": "미국/글로벌", "KR": "한국", "JP": "일본"}
 
@@ -282,7 +391,7 @@ def escape_html(s: str) -> str:
     return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
               .replace('"',"&quot;").replace("'","&#39;"))
 
-def build_email_html(items: List[Dict[str, Any]]) -> str:
+def build_email_html(items: List[Dict[str, Any]], title_cache: Dict[str, str]) -> str:
     grouped: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     for it in items:
         grouped.setdefault(it["category"], {}).setdefault(it["feed"], []).append(it)
@@ -290,11 +399,11 @@ def build_email_html(items: List[Dict[str, Any]]) -> str:
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
     html: List[str] = [
         f"<h2>{escape_html(SUBJECT_PREFIX)} {escape_html(now_local)}</h2>",
-        "<p style='color:#666'>※ 미국/한국/일본 뉴스가 한 통으로 발송됩니다. (미국/일본은 <b>제목만</b> 한글화)</p>",
+        "<p style='color:#666'>※ 한국은 원문 / 미국·일본은 <b>제목만</b> 한글 번역(무료)으로 발송됩니다.</p>",
         "<hr/>",
     ]
 
-    for category in ["US","KR","JP"]:
+    for category in ["US", "KR", "JP"]:
         feeds = grouped.get(category, {})
         if not feeds:
             continue
@@ -302,21 +411,25 @@ def build_email_html(items: List[Dict[str, Any]]) -> str:
         for feed_name, feed_items in feeds.items():
             html.append(f"<h3>{escape_html(feed_name)} ({len(feed_items)})</h3><ul>")
             for it in feed_items:
-                shown_title = title_for_category(it["title"], it["category"])
+                shown_title = translate_title_if_needed(it["title"], it["category"], title_cache)
                 title = escape_html(shown_title)
+
                 link = it["link"]
                 if RESOLVE_FINAL_URL:
                     link = resolve_final_url(link)
+
                 t = it.get("time")
                 t_str = t.astimezone().strftime("%Y-%m-%d %H:%M") if t else ""
                 meta = f" <small style='color:#666'>({escape_html(t_str)})</small>" if t_str else ""
                 html.append(f"<li><a href='{escape_html(link)}'>{title}</a>{meta}</li>")
             html.append("</ul><br/>")
         html.append("<hr/>")
+
     return "\n".join(html)
 
+
 # -----------------------------
-# 8) SMTP Send
+# 9) SMTP Send
 # -----------------------------
 def send_mail(subject: str, html_body: str) -> None:
     if not SMTP_USER or not SMTP_PASS or not MAIL_TO:
@@ -339,11 +452,13 @@ def send_mail(subject: str, html_body: str) -> None:
             s.login(SMTP_USER, SMTP_PASS)
             s.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
 
+
 # -----------------------------
-# 9) Main
+# 10) Main
 # -----------------------------
 def main() -> int:
     cache = load_cache()
+    title_cache = load_title_cache()
 
     all_items: List[Dict[str, Any]] = []
     for feed in FEEDS:
@@ -355,10 +470,12 @@ def main() -> int:
     fresh: List[Dict[str, Any]] = []
     now_ts = time.time()
 
+    # 실행 1회 내 중복은 '링크'만 제거(매체 달라도 링크 같으면 제거)
     seen_links = set()
     for it in all_items:
         key = make_key(it["category"], it["feed"], it["title"], it["link"])
         link_key = canonicalize_url(it["link"])
+
         if key in cache:
             continue
         if link_key in seen_links:
@@ -371,15 +488,19 @@ def main() -> int:
     if not fresh:
         print("[INFO] No new items.")
         save_cache(cache)
+        save_title_cache(title_cache)
         return 0
 
+    # 최신순 정렬
     fresh.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
 
+    # (옵션) 배치 윈도우 - 기본 OFF
     if BATCH_WINDOW_SECONDS > 0:
         newest_ts = fresh[0]["time"].timestamp() if fresh[0].get("time") else now_ts
         cutoff = newest_ts - BATCH_WINDOW_SECONDS
         fresh = [it for it in fresh if (it.get("time").timestamp() if it.get("time") else newest_ts) >= cutoff]
 
+    # 국가별 상한 적용(고르게)
     us = [x for x in fresh if x["category"] == "US"][:MAX_US]
     kr = [x for x in fresh if x["category"] == "KR"][:MAX_KR]
     jp = [x for x in fresh if x["category"] == "JP"][:MAX_JP]
@@ -391,10 +512,16 @@ def main() -> int:
         combined = combined[:MAX_ITEMS_PER_EMAIL]
 
     subject = f"{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    send_mail(subject, build_email_html(combined))
+    html_body = build_email_html(combined, title_cache)
+
+    send_mail(subject, html_body)
+
     save_cache(cache)
+    save_title_cache(title_cache)
+
     print(f"[OK] Sent {len(combined)} items to {MAIL_TO}")
     print(f"[INFO] Breakdown: US={len(us)} KR={len(kr)} JP={len(jp)}")
+    print(f"[INFO] Title translate: {TITLE_TRANSLATE} provider={TITLE_TRANSLATE_PROVIDER} sleep={TRANSLATE_SLEEP_SECONDS}s")
     return 0
 
 
