@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-rss_digest.py (googletrans 제거 / 무료·안정 / 제목만 한글 처리)
+rss_digest.py (무료·안정 / 제목만 한글 처리)
 
-핵심 변경
-- googletrans 완전 제거 → Python 3.11 / GitHub Actions에서 깨지는 문제 근본 차단
-- 제목은 기본 “원문 그대로” 전송
-- 이미 한글이 섞인 제목은 그대로 유지
-- (선택) 아주 가벼운 한글 용어 보정만 적용 (BOJ, Nikkei 등)
+핵심 변경 (2026-01-16)
+- 문제 원인인 90초 BATCH_WINDOW 필터를 기본 OFF로 변경 (BATCH_WINDOW_SECONDS 기본값 0)
+- 중복 제거를 "동일 링크" 중심으로 완화 (매체/피드가 달라도 링크가 다르면 남김)
+- 국가별 최소 보장/상한 적용 (기본: US 25, KR 25, JP 25) -> 한 통에 고르게 많이 들어오게
 """
 
 from __future__ import annotations
@@ -45,8 +44,16 @@ USER_AGENT = os.getenv(
 MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "30"))
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "48"))
 
-BATCH_WINDOW_SECONDS = int(os.getenv("BATCH_WINDOW_SECONDS", "90"))
-MAX_ITEMS_PER_EMAIL = int(os.getenv("MAX_ITEMS_PER_EMAIL", "80"))
+# 🔥 기존 90초 윈도우가 기사수를 1~2개로 만드는 원인이었음 → 기본 OFF
+BATCH_WINDOW_SECONDS = int(os.getenv("BATCH_WINDOW_SECONDS", "0"))
+
+# 한 통에 최대 몇 개까지 보낼지
+MAX_ITEMS_PER_EMAIL = int(os.getenv("MAX_ITEMS_PER_EMAIL", "120"))
+
+# 국가별 상한 (고르게 나오게)
+MAX_US = int(os.getenv("MAX_US", "25"))
+MAX_KR = int(os.getenv("MAX_KR", "25"))
+MAX_JP = int(os.getenv("MAX_JP", "25"))
 
 # JP focus
 JP_KEYWORD_MODE = os.getenv("JP_KEYWORD_MODE", "1").strip().lower() in ("1", "true", "yes")
@@ -224,7 +231,6 @@ def polish_ko_title(t: str) -> str:
     return re.sub(r"\s+", " ", out).strip()
 
 def translate_title_to_ko(title: str) -> str:
-    # 번역기 미사용: 한글이 이미 있으면 그대로, 아니면 원문 그대로(안정/무료)
     title = (title or "").strip()
     if not title:
         return title
@@ -339,14 +345,21 @@ def main() -> int:
 
     fresh: List[Dict[str, Any]] = []
     now_ts = time.time()
-    seen = set()
+
+    # 중복 제거 완화:
+    # - cache는 이미 "카테고리|피드|제목|링크" 기반으로 정확히 방지
+    # - 실행 1회 내에서는 "동일 링크"만 제거 (타 매체/피드/카테고리까지 날리지 않음)
+    seen_links = set()
 
     for it in all_items:
         key = make_key(it["category"], it["feed"], it["title"], it["link"])
-        gk  = normalize_title(it["title"]) + "|" + canonicalize_url(it["link"])
-        if key in cache or gk in seen:
+        link_key = canonicalize_url(it["link"])
+        if key in cache:
             continue
-        seen.add(gk)
+        if link_key in seen_links:
+            continue
+        seen_links.add(link_key)
+
         cache[key] = now_ts
         fresh.append(it)
 
@@ -355,22 +368,34 @@ def main() -> int:
         save_cache(cache)
         return 0
 
+    # 최신순 정렬
     fresh.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
 
+    # (옵션) 배치 윈도우: 기본 0(OFF)
     if BATCH_WINDOW_SECONDS > 0:
         newest_ts = fresh[0]["time"].timestamp() if fresh[0].get("time") else now_ts
         cutoff = newest_ts - BATCH_WINDOW_SECONDS
         fresh = [it for it in fresh if (it.get("time").timestamp() if it.get("time") else newest_ts) >= cutoff]
 
-    if MAX_ITEMS_PER_EMAIL > 0 and len(fresh) > MAX_ITEMS_PER_EMAIL:
-        fresh = fresh[:MAX_ITEMS_PER_EMAIL]
+    # 국가별 상한 적용 (고르게)
+    us = [x for x in fresh if x["category"] == "US"][:MAX_US]
+    kr = [x for x in fresh if x["category"] == "KR"][:MAX_KR]
+    jp = [x for x in fresh if x["category"] == "JP"][:MAX_JP]
+
+    combined = us + kr + jp
+    combined.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
+
+    if MAX_ITEMS_PER_EMAIL > 0 and len(combined) > MAX_ITEMS_PER_EMAIL:
+        combined = combined[:MAX_ITEMS_PER_EMAIL]
 
     subject = f"{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    send_mail(subject, build_email_html(fresh))
+    send_mail(subject, build_email_html(combined))
     save_cache(cache)
-    print(f"[OK] Sent {len(fresh)} items to {MAIL_TO}")
+    print(f"[OK] Sent {len(combined)} items to {MAIL_TO}")
+    print(f"[INFO] Breakdown: US={len(us)} KR={len(kr)} JP={len(jp)}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
