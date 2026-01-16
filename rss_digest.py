@@ -4,10 +4,10 @@
 """
 rss_digest.py (무료·안정 / 제목만 한글 처리)
 
-핵심 변경 (2026-01-16)
-- 문제 원인인 90초 BATCH_WINDOW 필터를 기본 OFF로 변경 (BATCH_WINDOW_SECONDS 기본값 0)
-- 중복 제거를 "동일 링크" 중심으로 완화 (매체/피드가 달라도 링크가 다르면 남김)
-- 국가별 최소 보장/상한 적용 (기본: US 25, KR 25, JP 25) -> 한 통에 고르게 많이 들어오게
+동작 규칙
+- KR(한국): 제목 그대로
+- US/JP(미국/일본): 제목만 한글화(용어 치환 기반, 무료)
+- 본문은 원문 유지
 """
 
 from __future__ import annotations
@@ -44,18 +44,18 @@ USER_AGENT = os.getenv(
 MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "30"))
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "48"))
 
-# 🔥 기존 90초 윈도우가 기사수를 1~2개로 만드는 원인이었음 → 기본 OFF
+# 배치 윈도우 기본 OFF
 BATCH_WINDOW_SECONDS = int(os.getenv("BATCH_WINDOW_SECONDS", "0"))
 
-# 한 통에 최대 몇 개까지 보낼지
+# 한 통 최대 개수
 MAX_ITEMS_PER_EMAIL = int(os.getenv("MAX_ITEMS_PER_EMAIL", "120"))
 
-# 국가별 상한 (고르게 나오게)
+# 국가별 상한
 MAX_US = int(os.getenv("MAX_US", "25"))
 MAX_KR = int(os.getenv("MAX_KR", "25"))
 MAX_JP = int(os.getenv("MAX_JP", "25"))
 
-# JP focus
+# JP 키워드 필터 (원하면 OFF)
 JP_KEYWORD_MODE = os.getenv("JP_KEYWORD_MODE", "1").strip().lower() in ("1", "true", "yes")
 JP_KEYWORDS = [k.strip() for k in os.getenv(
     "JP_KEYWORDS",
@@ -187,12 +187,6 @@ def make_key(category: str, feed_name: str, title: str, link: str) -> str:
     raw = f"{category}|{feed_name}|{title}|{link}".encode("utf-8", errors="ignore")
     return hashlib.sha256(raw).hexdigest()
 
-def normalize_title(title: str) -> str:
-    t = (title or "").strip().lower()
-    t = re.sub(r"\s+[-|]\s+(reuters|cnbc|nhk|nikkei)\s*$", "", t, flags=re.I)
-    t = re.sub(r"\s+", " ", t)
-    return t[:180]
-
 def jp_keyword_pass(title: str) -> bool:
     if not JP_KEYWORD_MODE:
         return True
@@ -208,7 +202,7 @@ def filter_recent(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [it for it in items if not it.get("time") or it["time"].timestamp() >= cutoff]
 
 # -----------------------------
-# 5) “무료/안정” 제목 처리 (번역기 없음)
+# 5) 제목 한글화(무료, 용어 치환)
 # -----------------------------
 def has_hangul(s: str) -> bool:
     return any('가' <= ch <= '힣' for ch in s)
@@ -222,6 +216,10 @@ _GLOSSARY = [
     (re.compile(r"\bJPY\b", re.I), "엔화(JPY)"),
     (re.compile(r"\byen\b", re.I), "엔화"),
     (re.compile(r"\bFed\b", re.I), "미 연준(Fed)"),
+    (re.compile(r"\bECB\b", re.I), "유럽중앙은행(ECB)"),
+    (re.compile(r"\bCPI\b", re.I), "소비자물가(CPI)"),
+    (re.compile(r"\bPPI\b", re.I), "생산자물가(PPI)"),
+    (re.compile(r"\bGDP\b", re.I), "국내총생산(GDP)"),
 ]
 
 def polish_ko_title(t: str) -> str:
@@ -230,13 +228,23 @@ def polish_ko_title(t: str) -> str:
         out = pat.sub(rep, out)
     return re.sub(r"\s+", " ", out).strip()
 
-def translate_title_to_ko(title: str) -> str:
-    title = (title or "").strip()
-    if not title:
-        return title
-    if has_hangul(title):
-        return polish_ko_title(title)
-    return polish_ko_title(title)
+def title_for_category(original: str, category: str) -> str:
+    """
+    KR: 그대로
+    US/JP: 제목만 한글화(용어 치환)
+    """
+    t = (original or "").strip()
+    if not t:
+        return t
+
+    if category == "KR":
+        return t
+
+    # 이미 한글이 있으면 다듬기만
+    if has_hangul(t):
+        return polish_ko_title(t)
+
+    return polish_ko_title(t)
 
 # -----------------------------
 # 6) Fetch feed items
@@ -282,7 +290,7 @@ def build_email_html(items: List[Dict[str, Any]]) -> str:
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
     html: List[str] = [
         f"<h2>{escape_html(SUBJECT_PREFIX)} {escape_html(now_local)}</h2>",
-        "<p style='color:#666'>※ 미국/한국/일본 뉴스가 한 통으로 발송됩니다. <b>제목만</b> 한국어로 처리됩니다.</p>",
+        "<p style='color:#666'>※ 미국/한국/일본 뉴스가 한 통으로 발송됩니다. (미국/일본은 <b>제목만</b> 한글화)</p>",
         "<hr/>",
     ]
 
@@ -294,7 +302,8 @@ def build_email_html(items: List[Dict[str, Any]]) -> str:
         for feed_name, feed_items in feeds.items():
             html.append(f"<h3>{escape_html(feed_name)} ({len(feed_items)})</h3><ul>")
             for it in feed_items:
-                title = escape_html(translate_title_to_ko(it["title"]))
+                shown_title = title_for_category(it["title"], it["category"])
+                title = escape_html(shown_title)
                 link = it["link"]
                 if RESOLVE_FINAL_URL:
                     link = resolve_final_url(link)
@@ -346,11 +355,7 @@ def main() -> int:
     fresh: List[Dict[str, Any]] = []
     now_ts = time.time()
 
-    # 중복 제거 완화:
-    # - cache는 이미 "카테고리|피드|제목|링크" 기반으로 정확히 방지
-    # - 실행 1회 내에서는 "동일 링크"만 제거 (타 매체/피드/카테고리까지 날리지 않음)
     seen_links = set()
-
     for it in all_items:
         key = make_key(it["category"], it["feed"], it["title"], it["link"])
         link_key = canonicalize_url(it["link"])
@@ -368,16 +373,13 @@ def main() -> int:
         save_cache(cache)
         return 0
 
-    # 최신순 정렬
     fresh.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
 
-    # (옵션) 배치 윈도우: 기본 0(OFF)
     if BATCH_WINDOW_SECONDS > 0:
         newest_ts = fresh[0]["time"].timestamp() if fresh[0].get("time") else now_ts
         cutoff = newest_ts - BATCH_WINDOW_SECONDS
         fresh = [it for it in fresh if (it.get("time").timestamp() if it.get("time") else newest_ts) >= cutoff]
 
-    # 국가별 상한 적용 (고르게)
     us = [x for x in fresh if x["category"] == "US"][:MAX_US]
     kr = [x for x in fresh if x["category"] == "KR"][:MAX_KR]
     jp = [x for x in fresh if x["category"] == "JP"][:MAX_JP]
@@ -398,4 +400,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
