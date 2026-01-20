@@ -2,14 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-scan_close_kr.py (KR close scan)
-- KOSPI + KOSDAQ 전체 종목을 일봉(장마감 기준)으로 스캔
-- 기본 필터:
-  1) 종가 > MA20
-  2) RSI(14) >= 55
-  3) MACD Histogram >= 0
-  4) 일간 등락률(%) >= min-change
-- 결과를 stdout + 파일(txt/json)로 저장 가능 (워크플로우/레이더 연동용)
+scan_close_kr.py (KR close scan - finalists)
+실전 업그레이드:
+- 상한가/과열 제거 옵션: --max-change, --rsi-max
+- 거래량 옵션: --use-volume --vol-mult
+- 점수화(score) 기반 정렬: 기본 ON (chg + rsi + macd)
+- 보유/관심 종목 표시: --watchlist watchlist_kr.txt (코드/이름 부분일치)
+
+출력:
+- out/scan_close_kr.txt
+- out/scan_close_kr.json (telegram_preview 포함)
 
 의존성:
   pip install pandas numpy yfinance finance-datareader
@@ -31,6 +33,7 @@ except Exception:
     fdr = None
 
 
+# ----------------- indicators -----------------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
@@ -54,9 +57,10 @@ def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9)
     return macd_line - signal_line
 
 
+# ----------------- data -----------------
 def get_krx_tickers() -> pd.DataFrame:
     if fdr is None:
-        raise RuntimeError("FinanceDataReader가 없습니다. requirements.txt에 `finance-datareader`를 넣고 설치하세요.")
+        raise RuntimeError("FinanceDataReader import 실패. requirements.txt에 `finance-datareader`가 있어야 합니다.")
 
     df = fdr.StockListing("KRX")
     if not {"Code", "Name"}.issubset(df.columns):
@@ -78,15 +82,11 @@ def get_krx_tickers() -> pd.DataFrame:
 
 
 def yf_symbol_from_code(code: str, market: str) -> str:
-    suffix = ".KS" if market == "KOSPI" else ".KQ"
-    return f"{str(code).zfill(6)}{suffix}"
+    return f"{str(code).zfill(6)}{'.KS' if market == 'KOSPI' else '.KQ'}"
 
 
 def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    yfinance가 MultiIndex columns로 오는 경우가 있어서 1단 컬럼으로 평탄화
-    예: ('Close', '005930.KS') -> 'Close'
-    """
+    # yfinance가 MultiIndex로 내려오는 케이스 방지
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
         df.columns = df.columns.get_level_values(0)
@@ -106,24 +106,21 @@ def fetch_ohlcv_yf(symbol: str, lookback_days: int = 280) -> pd.DataFrame:
         progress=False,
         threads=False,
     )
-
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = _flatten_yf_columns(df)
 
-    # 표준 컬럼명으로 통일
-    rename_map = {
-        "Open": "open",
-        "High": "high",
-        "Low": "low",
-        "Close": "close",
-        "Adj Close": "adj_close",
-        "Volume": "volume",
-    }
-    df = df.rename(columns=rename_map)
-
-    # 필요한 컬럼이 없으면 빈 DF 반환
+    df = df.rename(
+        columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Adj Close": "adj_close",
+            "Volume": "volume",
+        }
+    )
     needed = {"open", "high", "low", "close", "volume"}
     if not needed.issubset(set(map(str, df.columns))):
         return pd.DataFrame()
@@ -132,33 +129,24 @@ def fetch_ohlcv_yf(symbol: str, lookback_days: int = 280) -> pd.DataFrame:
     return df.sort_index()
 
 
-def _to_scalar(x, default: float = 0.0) -> float:
-    """
-    어떤 타입이 들어와도 마지막 값을 '스칼라 float'로 안전 변환
-    - Series: .iloc[-1]
-    - DataFrame: 마지막 행/열 값
-    - ndarray/list: 마지막 원소
-    """
+def _to_scalar_last(x, default: float = 0.0) -> float:
+    """어떤 타입이 와도 마지막 값을 float로 안전 변환"""
     try:
         if isinstance(x, pd.DataFrame):
             if x.empty:
                 return default
             v = x.iloc[-1, -1]
             return default if pd.isna(v) else float(v)
-
         if isinstance(x, pd.Series):
             if x.empty:
                 return default
             v = x.iloc[-1]
             return default if pd.isna(v) else float(v)
-
         if isinstance(x, (np.ndarray, list, tuple)):
             if len(x) == 0:
                 return default
             v = x[-1]
             return default if pd.isna(v) else float(v)
-
-        # 스칼라
         return default if pd.isna(x) else float(x)
     except Exception:
         return default
@@ -168,11 +156,9 @@ def compute_signals(df: pd.DataFrame) -> dict:
     if df.shape[0] < 70:
         return {}
 
-    # ✅ 무조건 Series로 만들기 (혹시 모를 DataFrame/객체 타입 방지)
     close = pd.to_numeric(df["close"], errors="coerce")
     volume = pd.to_numeric(df["volume"], errors="coerce")
-
-    if close.isna().all() or volume.isna().all():
+    if close.isna().all():
         return {}
 
     ma20 = close.rolling(20).mean()
@@ -180,52 +166,119 @@ def compute_signals(df: pd.DataFrame) -> dict:
     hist = macd_hist(close, 12, 26, 9)
     vol_ma20 = volume.rolling(20).mean()
 
-    # ✅ 핵심: 변화율 마지막값을 Series 아닌 '스칼라'로 강제 변환
-    chg_last = _to_scalar(close.pct_change() * 100.0, default=np.nan)
+    chg_last = _to_scalar_last(close.pct_change() * 100.0, default=np.nan)
 
-    last = df.index[-1]
+    last_dt = df.index[-1]
     return {
-        "date": last.strftime("%Y-%m-%d"),
-        "close": _to_scalar(close, default=0.0),
+        "date": last_dt.strftime("%Y-%m-%d"),
+        "close": _to_scalar_last(close, 0.0),
         "change_pct": 0.0 if pd.isna(chg_last) else float(chg_last),
-        "ma20": _to_scalar(ma20, default=0.0),
-        "rsi14": _to_scalar(rsi14, default=0.0),
-        "macd_hist": _to_scalar(hist, default=0.0),
-        "volume": _to_scalar(volume, default=0.0),
-        "vol_ma20": _to_scalar(vol_ma20, default=0.0),
+        "ma20": _to_scalar_last(ma20, 0.0),
+        "rsi14": _to_scalar_last(rsi14, 0.0),
+        "macd_hist": _to_scalar_last(hist, 0.0),
+        "volume": _to_scalar_last(volume, 0.0),
+        "vol_ma20": _to_scalar_last(vol_maQA20, 0.0) if False else _to_scalar_last(vol_ma20, 0.0),
     }
+
+
+# ----------------- watchlist -----------------
+def load_watchlist(path: str) -> list[str]:
+    if not path:
+        return []
+    p = Path(path)
+    if not p.exists():
+        return []
+    items = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        items.append(s)
+    return items
+
+
+def is_watch(code: str, name: str, watch: list[str]) -> bool:
+    if not watch:
+        return False
+    c = str(code).zfill(6)
+    n = str(name)
+    for w in watch:
+        # 코드(6자리) 또는 이름 부분일치 모두 허용
+        if w.isdigit() and len(w) in (5, 6):
+            if c == w.zfill(6):
+                return True
+        else:
+            if w in n:
+                return True
+    return False
+
+
+# ----------------- scoring & filters -----------------
+def norm_clip(x: float, lo: float, hi: float) -> float:
+    if hi <= lo:
+        return 0.0
+    v = (x - lo) / (hi - lo)
+    return float(max(0.0, min(1.0, v)))
+
+
+def compute_score(sig: dict) -> float:
+    # 실전용: chg(0~15), rsi(50~75), macd_hist(0~상대)
+    chg = sig["change_pct"]
+    r = sig["rsi14"]
+    mh = sig["macd_hist"]
+
+    # macd_hist는 종목마다 스케일이 커서 로그/클립으로 안정화
+    mh_s = np.log1p(max(0.0, mh))
+
+    score = (
+        0.45 * norm_clip(chg, 0, 15) +
+        0.35 * norm_clip(r, 50, 75) +
+        0.20 * norm_clip(mh_s, 0, 6)
+    )
+    return round(score * 100, 2)
 
 
 def passes_filters(sig: dict,
                    min_change: float,
+                   max_change: float | None,
                    min_price: float,
                    require_ma20: bool,
                    require_macd: bool,
                    rsi_min: float,
+                   rsi_max: float | None,
                    use_volume: bool,
                    vol_mult: float) -> bool:
     if not sig:
         return False
     if sig["close"] < min_price:
         return False
+
     if sig["change_pct"] < min_change:
         return False
+    if max_change is not None and sig["change_pct"] > max_change:
+        return False
+
     if require_ma20 and not (sig["close"] > sig["ma20"]):
         return False
     if require_macd and not (sig["macd_hist"] >= 0):
         return False
+
     if sig["rsi14"] < rsi_min:
         return False
+    if rsi_max is not None and sig["rsi14"] > rsi_max:
+        return False
+
     if use_volume:
         if sig["vol_ma20"] <= 0:
             return False
         if sig["volume"] < sig["vol_ma20"] * vol_mult:
             return False
+
     return True
 
 
 def format_table(df: pd.DataFrame, use_volume: bool) -> str:
-    cols = ["market", "code", "name", "close", "chg%", "ma20", "rsi14", "macd_hist"]
+    cols = ["mark", "market", "code", "name", "score", "close", "chg%", "ma20", "rsi14", "macd_hist"]
     if use_volume:
         cols += ["vol", "vol_ma20"]
     return df[cols].to_string(index=False)
@@ -233,23 +286,33 @@ def format_table(df: pd.DataFrame, use_volume: bool) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
+    # 기본값을 “실전 매수 후보” 쪽으로 설정
     ap.add_argument("--min-change", type=float, default=3.0, help="일간 등락률 최소(%)")
+    ap.add_argument("--max-change", type=float, default=15.0, help="일간 등락률 최대(%) (상한가/과열 제거)")
     ap.add_argument("--min-price", type=float, default=1000.0, help="최소 종가(원)")
     ap.add_argument("--rsi-min", type=float, default=55.0, help="RSI(14) 최소")
-    ap.add_argument("--top", type=int, default=60, help="상위 N개 출력")
-    ap.add_argument("--use-volume", action="store_true", help="거래량 조건 추가(기본 OFF)")
+    ap.add_argument("--rsi-max", type=float, default=75.0, help="RSI(14) 최대(과열 제거)")
+
+    ap.add_argument("--top", type=int, default=40, help="상위 N개 출력")
+    ap.add_argument("--use-volume", action="store_true", help="거래량 조건 ON")
     ap.add_argument("--vol-mult", type=float, default=1.3, help="거래량 배수(20일평균 대비)")
-    ap.add_argument("--no-ma20", action="store_true", help="MA20 돌파 조건 끄기")
-    ap.add_argument("--no-macd", action="store_true", help="MACD 양수 조건 끄기")
+    ap.add_argument("--no-ma20", action="store_true", help="MA20 조건 끄기")
+    ap.add_argument("--no-macd", action="store_true", help="MACD 조건 끄기")
+
+    ap.add_argument("--watchlist", type=str, default="watchlist_kr.txt",
+                    help="보유/관심 종목 리스트 파일 (없으면 자동 무시)")
     ap.add_argument("--limit", type=int, default=0, help="테스트용: 티커 N개만(0이면 전체)")
 
-    ap.add_argument("--out-text", type=str, default="out/scan_close_kr.txt", help="텍스트 결과 저장 경로")
-    ap.add_argument("--out-json", type=str, default="out/scan_close_kr.json", help="JSON 결과 저장 경로")
-    ap.add_argument("--telegram-lines", type=int, default=25, help="텔레그램용 요약 라인 수")
+    ap.add_argument("--out-text", type=str, default="out/scan_close_kr.txt")
+    ap.add_argument("--out-json", type=str, default="out/scan_close_kr.json")
+    ap.add_argument("--telegram-lines", type=int, default=25)
 
     args = ap.parse_args()
+
     require_ma20 = not args.no_ma20
     require_macd = not args.no_macd
+
+    watch = load_watchlist(args.watchlist)
 
     tickers_df = get_krx_tickers()
     if args.limit and args.limit > 0:
@@ -275,19 +338,25 @@ def main():
         if passes_filters(
             sig=sig,
             min_change=args.min_change,
+            max_change=args.max_change if args.max_change is not None else None,
             min_price=args.min_price,
             require_ma20=require_ma20,
             require_macd=require_macd,
             rsi_min=args.rsi_min,
+            rsi_max=args.rsi_max if args.rsi_max is not None else None,
             use_volume=args.use_volume,
             vol_mult=args.vol_mult,
         ):
+            mark = "⭐" if is_watch(code, name, watch) else ""
+            score = compute_score(sig)
             results.append({
+                "mark": mark,
                 "code": code,
                 "name": name,
                 "market": market,
                 "symbol": symbol,
                 "date": sig["date"],
+                "score": score,
                 "close": sig["close"],
                 "chg%": sig["change_pct"],
                 "ma20": sig["ma20"],
@@ -297,44 +366,51 @@ def main():
                 "vol_ma20": sig["vol_ma20"],
             })
 
-        if (i + 1) % 400 == 0:
+        if (i + 1) % 500 == 0:
             print(f"...progress {i+1}/{total}", file=sys.stderr)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     header = (
-        f"[KR CLOSE SCAN] {now} | min_change={args.min_change}% | rsi>={args.rsi_min} | "
-        f"MA20={'ON' if require_ma20 else 'OFF'} | MACD={'ON' if require_macd else 'OFF'} | "
-        f"VOL={'ON' if args.use_volume else 'OFF'}"
+        f"[KR CLOSE SCAN] {now} | min={args.min_change}% max={args.max_change}% | "
+        f"RSI {args.rsi_min}~{args.rsi_max} | MA20={'ON' if require_ma20 else 'OFF'} | "
+        f"MACD={'ON' if require_macd else 'OFF'} | VOL={'ON' if args.use_volume else 'OFF'} x{args.vol_mult}"
     )
 
-    out_dir = Path(args.out_text).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_text = Path(args.out_text)
+    out_json = Path(args.out_json)
+    out_text.parent.mkdir(parents=True, exist_ok=True)
+    out_json.parent.mkdir(parents=True, exist_ok=True)
 
     if not results:
         text = header + "\n" + "-" * len(header) + "\nNO SIGNALS\n"
         print(text.strip())
-        Path(args.out_text).write_text(text, encoding="utf-8")
-        Path(args.out_json).write_text(
+        out_text.write_text(text, encoding="utf-8")
+        out_json.write_text(
             json.dumps({"meta": {"generated_at": now, "header": header, "args": vars(args)}, "items": []},
                        ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
         return
 
-    df_out = pd.DataFrame(results).sort_values(["chg%", "rsi14"], ascending=[False, False]).reset_index(drop=True)
+    df_out = pd.DataFrame(results)
+
+    # 점수 중심 정렬: score DESC, 그 다음 chg, rsi
+    df_out = df_out.sort_values(["score", "chg%", "rsi14"], ascending=[False, False, False]).reset_index(drop=True)
+
     df_out["close"] = df_out["close"].round(0).astype(int)
     df_out["chg%"] = df_out["chg%"].round(2)
     df_out["ma20"] = df_out["ma20"].round(0).astype(int)
     df_out["rsi14"] = df_out["rsi14"].round(1)
     df_out["macd_hist"] = df_out["macd_hist"].round(4)
+    df_out["vol"] = df_out["vol"].round(0).astype(int)
+    df_out["vol_ma20"] = df_out["vol_ma20"].round(0).astype(int)
 
     top_n = min(args.top, len(df_out))
     df_top = df_out.head(top_n).copy()
 
     text = header + "\n" + "-" * len(header) + "\n" + format_table(df_top, args.use_volume) + "\n"
     print(text.strip())
-
-    Path(args.out_text).write_text(text, encoding="utf-8")
+    out_text.write_text(text, encoding="utf-8")
 
     payload = {
         "meta": {
@@ -344,9 +420,9 @@ def main():
             "count": int(len(df_top)),
         },
         "items": df_top.to_dict(orient="records"),
-        "telegram_preview": "\n".join(text.strip().splitlines()[: max(10, args.telegram_lines)]),
+        "telegram_preview": "\n".join(text.strip().splitlines()[: max(12, args.telegram_lines)]),
     }
-    Path(args.out_json).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
