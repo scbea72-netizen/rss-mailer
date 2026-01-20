@@ -24,11 +24,43 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run KR close scan
+      - name: Run KR close scan (save out)
         run: |
-          python scan_close_kr.py --min-change 2 --rsi-min 55 --top 60
+          python scan_close_kr.py \
+            --min-change 2 \
+            --rsi-min 55 \
+            --top 60 \
+            --out-text out/scan_close_kr.txt \
+            --out-json out/scan_close_kr.json
 
-      - name: List outputs (debug)
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kr-close-scan
+          path: out/
+
+      - name: Telegram notify (optional)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          ls -la
-          ls -la out || true
+          python - << 'PY'
+          import json, os, sys, urllib.parse, urllib.request
+
+          token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+          chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+
+          # 시크릿 없으면 조용히 종료 (워크플로우 성공 처리)
+          if not token or not chat_id:
+              print("Telegram secrets not set. Skip.")
+              sys.exit(0)
+
+          p = json.load(open("out/scan_close_kr.json", "r", encoding="utf-8"))
+          msg = p.get("telegram_preview") or p.get("meta", {}).get("header", "KR CLOSE SCAN")
+          msg = msg[:3500]
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          data = urllib.parse.urlencode({"chat_id": chat_id, "text": msg}).encode()
+          urllib.request.urlopen(url, data=data, timeout=30).read()
+          print("Telegram sent")
+          PY
