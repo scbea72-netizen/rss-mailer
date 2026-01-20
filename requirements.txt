@@ -1,6 +1,4 @@
-requests
-yfinance
-pandas
-feedparser
+pandas>=1.5
+numpy>=1.23
+yfinance>=0.2
 FinanceDataReader
-numpy
