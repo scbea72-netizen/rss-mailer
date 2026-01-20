@@ -8,11 +8,11 @@ scan_close_kr.py (KR close scan)
   1) 종가 > MA20
   2) RSI(14) >= 55
   3) MACD Histogram >= 0
-  4) 일간 등락률(%) >= 3.0
+  4) 일간 등락률(%) >= 2.0 (워크플로우 기본)
 - 결과를 stdout + 파일(txt/json)로 저장 가능 (워크플로우/레이더 연동용)
 
 의존성:
-  pip install pandas numpy yfinance FinanceDataReader
+  pip install pandas numpy yfinance finance-datareader
 """
 
 import argparse
@@ -56,7 +56,7 @@ def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9)
 
 def get_krx_tickers() -> pd.DataFrame:
     if fdr is None:
-        raise RuntimeError("FinanceDataReader가 없습니다. `pip install FinanceDataReader` 해주세요.")
+        raise RuntimeError("FinanceDataReader가 없습니다. requirements.txt에 `finance-datareader`를 넣고 설치하세요.")
 
     df = fdr.StockListing("KRX")
     if not {"Code", "Name"}.issubset(df.columns):
@@ -110,7 +110,27 @@ def fetch_ohlcv_yf(symbol: str, lookback_days: int = 280) -> pd.DataFrame:
     return df.sort_index()
 
 
+def _safe_float(x, default: float = 0.0) -> float:
+    """
+    pandas/np 값이 Series/ndarray로 들어오는 경우를 방지해서 안전하게 float로 변환
+    """
+    try:
+        if isinstance(x, (pd.Series, np.ndarray, list)):
+            if len(x) == 0:
+                return default
+            x = x[-1]
+        if pd.isna(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
 def compute_signals(df: pd.DataFrame) -> dict:
+    """
+    ✅ 여기서 Series ambiguous 에러가 났기 때문에
+    모든 '마지막 값'을 스칼라로 먼저 만든 후 float 변환
+    """
     if df.shape[0] < 70:
         return {}
 
@@ -120,20 +140,22 @@ def compute_signals(df: pd.DataFrame) -> dict:
     ma20 = close.rolling(20).mean()
     rsi14 = rsi(close, 14)
     hist = macd_hist(close, 12, 26, 9)
-    chg = close.pct_change() * 100.0
+
+    # ✅ 핵심 수정: 마지막 변화율을 '먼저' 스칼라로 만든다
+    chg_last = (close.pct_change() * 100.0).iloc[-1]
 
     vol_ma20 = volume.rolling(20).mean()
 
     last = df.index[-1]
     return {
         "date": last.strftime("%Y-%m-%d"),
-        "close": float(close.iloc[-1]),
-        "change_pct": float(chg.iloc[-1]) if not np.isnan(chg.iloc[-1]) else 0.0,
-        "ma20": float(ma20.iloc[-1]) if not np.isnan(ma20.iloc[-1]) else 0.0,
-        "rsi14": float(rsi14.iloc[-1]),
-        "macd_hist": float(hist.iloc[-1]) if not np.isnan(hist.iloc[-1]) else 0.0,
-        "volume": float(volume.iloc[-1]) if not np.isnan(volume.iloc[-1]) else 0.0,
-        "vol_ma20": float(vol_ma20.iloc[-1]) if not np.isnan(vol_ma20.iloc[-1]) else 0.0,
+        "close": _safe_float(close.iloc[-1]),
+        "change_pct": float(chg_last) if pd.notna(chg_last) else 0.0,  # ✅ FIXED
+        "ma20": _safe_float(ma20.iloc[-1]),
+        "rsi14": _safe_float(rsi14.iloc[-1]),
+        "macd_hist": _safe_float(hist.iloc[-1]),
+        "volume": _safe_float(volume.iloc[-1]),
+        "vol_ma20": _safe_float(vol_ma20.iloc[-1]),
     }
 
 
@@ -256,7 +278,11 @@ def main():
         text = header + "\n" + "-" * len(header) + "\nNO SIGNALS\n"
         print(text.strip())
         Path(args.out_text).write_text(text, encoding="utf-8")
-        Path(args.out_json).write_text(json.dumps({"meta": {"header": header}, "items": []}, ensure_ascii=False, indent=2), encoding="utf-8")
+        Path(args.out_json).write_text(
+            json.dumps({"meta": {"generated_at": now, "header": header, "args": vars(args)}, "items": []},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
         return
 
     df_out = pd.DataFrame(results).sort_values(["chg%", "rsi14"], ascending=[False, False]).reset_index(drop=True)
@@ -272,8 +298,8 @@ def main():
     text = header + "\n" + "-" * len(header) + "\n" + format_table(df_top, args.use_volume) + "\n"
     print(text.strip())
 
-    # ✅ 파일 저장(레이더/워크플로우 연동 핵심)
     Path(args.out_text).write_text(text, encoding="utf-8")
+
     payload = {
         "meta": {
             "generated_at": now,
