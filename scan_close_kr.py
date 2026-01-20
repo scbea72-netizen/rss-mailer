@@ -8,7 +8,7 @@ scan_close_kr.py (KR close scan)
   1) 종가 > MA20
   2) RSI(14) >= 55
   3) MACD Histogram >= 0
-  4) 일간 등락률(%) >= 2.0 (워크플로우 기본)
+  4) 일간 등락률(%) >= min-change
 - 결과를 stdout + 파일(txt/json)로 저장 가능 (워크플로우/레이더 연동용)
 
 의존성:
@@ -82,6 +82,17 @@ def yf_symbol_from_code(code: str, market: str) -> str:
     return f"{str(code).zfill(6)}{suffix}"
 
 
+def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    yfinance가 MultiIndex columns로 오는 경우가 있어서 1단 컬럼으로 평탄화
+    예: ('Close', '005930.KS') -> 'Close'
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
 def fetch_ohlcv_yf(symbol: str, lookback_days: int = 280) -> pd.DataFrame:
     end = datetime.utcnow().date() + timedelta(days=1)
     start = end - timedelta(days=lookback_days)
@@ -95,67 +106,93 @@ def fetch_ohlcv_yf(symbol: str, lookback_days: int = 280) -> pd.DataFrame:
         progress=False,
         threads=False,
     )
+
     if df is None or df.empty:
         return pd.DataFrame()
 
-    df = df.rename(columns={
+    df = _flatten_yf_columns(df)
+
+    # 표준 컬럼명으로 통일
+    rename_map = {
         "Open": "open",
         "High": "high",
         "Low": "low",
         "Close": "close",
         "Adj Close": "adj_close",
         "Volume": "volume",
-    })
+    }
+    df = df.rename(columns=rename_map)
+
+    # 필요한 컬럼이 없으면 빈 DF 반환
+    needed = {"open", "high", "low", "close", "volume"}
+    if not needed.issubset(set(map(str, df.columns))):
+        return pd.DataFrame()
+
     df.index = pd.to_datetime(df.index)
     return df.sort_index()
 
 
-def _safe_float(x, default: float = 0.0) -> float:
+def _to_scalar(x, default: float = 0.0) -> float:
     """
-    pandas/np 값이 Series/ndarray로 들어오는 경우를 방지해서 안전하게 float로 변환
+    어떤 타입이 들어와도 마지막 값을 '스칼라 float'로 안전 변환
+    - Series: .iloc[-1]
+    - DataFrame: 마지막 행/열 값
+    - ndarray/list: 마지막 원소
     """
     try:
-        if isinstance(x, (pd.Series, np.ndarray, list)):
+        if isinstance(x, pd.DataFrame):
+            if x.empty:
+                return default
+            v = x.iloc[-1, -1]
+            return default if pd.isna(v) else float(v)
+
+        if isinstance(x, pd.Series):
+            if x.empty:
+                return default
+            v = x.iloc[-1]
+            return default if pd.isna(v) else float(v)
+
+        if isinstance(x, (np.ndarray, list, tuple)):
             if len(x) == 0:
                 return default
-            x = x[-1]
-        if pd.isna(x):
-            return default
-        return float(x)
+            v = x[-1]
+            return default if pd.isna(v) else float(v)
+
+        # 스칼라
+        return default if pd.isna(x) else float(x)
     except Exception:
         return default
 
 
 def compute_signals(df: pd.DataFrame) -> dict:
-    """
-    ✅ 여기서 Series ambiguous 에러가 났기 때문에
-    모든 '마지막 값'을 스칼라로 먼저 만든 후 float 변환
-    """
     if df.shape[0] < 70:
         return {}
 
-    close = df["close"].astype(float)
-    volume = df["volume"].astype(float)
+    # ✅ 무조건 Series로 만들기 (혹시 모를 DataFrame/객체 타입 방지)
+    close = pd.to_numeric(df["close"], errors="coerce")
+    volume = pd.to_numeric(df["volume"], errors="coerce")
+
+    if close.isna().all() or volume.isna().all():
+        return {}
 
     ma20 = close.rolling(20).mean()
     rsi14 = rsi(close, 14)
     hist = macd_hist(close, 12, 26, 9)
-
-    # ✅ 핵심 수정: 마지막 변화율을 '먼저' 스칼라로 만든다
-    chg_last = (close.pct_change() * 100.0).iloc[-1]
-
     vol_ma20 = volume.rolling(20).mean()
+
+    # ✅ 핵심: 변화율 마지막값을 Series 아닌 '스칼라'로 강제 변환
+    chg_last = _to_scalar(close.pct_change() * 100.0, default=np.nan)
 
     last = df.index[-1]
     return {
         "date": last.strftime("%Y-%m-%d"),
-        "close": _safe_float(close.iloc[-1]),
-        "change_pct": float(chg_last) if pd.notna(chg_last) else 0.0,  # ✅ FIXED
-        "ma20": _safe_float(ma20.iloc[-1]),
-        "rsi14": _safe_float(rsi14.iloc[-1]),
-        "macd_hist": _safe_float(hist.iloc[-1]),
-        "volume": _safe_float(volume.iloc[-1]),
-        "vol_ma20": _safe_float(vol_ma20.iloc[-1]),
+        "close": _to_scalar(close, default=0.0),
+        "change_pct": 0.0 if pd.isna(chg_last) else float(chg_last),
+        "ma20": _to_scalar(ma20, default=0.0),
+        "rsi14": _to_scalar(rsi14, default=0.0),
+        "macd_hist": _to_scalar(hist, default=0.0),
+        "volume": _to_scalar(volume, default=0.0),
+        "vol_ma20": _to_scalar(vol_ma20, default=0.0),
     }
 
 
@@ -196,20 +233,19 @@ def format_table(df: pd.DataFrame, use_volume: bool) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--min-change", type=float, default=3.0, help="일간 등락률 최소(%) (기본 3.0)")
-    ap.add_argument("--min-price", type=float, default=1000.0, help="최소 종가(원) (기본 1000)")
-    ap.add_argument("--rsi-min", type=float, default=55.0, help="RSI(14) 최소 (기본 55)")
-    ap.add_argument("--top", type=int, default=60, help="상위 N개 출력 (기본 60)")
+    ap.add_argument("--min-change", type=float, default=3.0, help="일간 등락률 최소(%)")
+    ap.add_argument("--min-price", type=float, default=1000.0, help="최소 종가(원)")
+    ap.add_argument("--rsi-min", type=float, default=55.0, help="RSI(14) 최소")
+    ap.add_argument("--top", type=int, default=60, help="상위 N개 출력")
     ap.add_argument("--use-volume", action="store_true", help="거래량 조건 추가(기본 OFF)")
-    ap.add_argument("--vol-mult", type=float, default=1.3, help="거래량 배수(20일평균 대비) (기본 1.3)")
+    ap.add_argument("--vol-mult", type=float, default=1.3, help="거래량 배수(20일평균 대비)")
     ap.add_argument("--no-ma20", action="store_true", help="MA20 돌파 조건 끄기")
     ap.add_argument("--no-macd", action="store_true", help="MACD 양수 조건 끄기")
     ap.add_argument("--limit", type=int, default=0, help="테스트용: 티커 N개만(0이면 전체)")
 
-    # ✅ 레이더/워크플로우 연동용 출력 파일
     ap.add_argument("--out-text", type=str, default="out/scan_close_kr.txt", help="텍스트 결과 저장 경로")
     ap.add_argument("--out-json", type=str, default="out/scan_close_kr.json", help="JSON 결과 저장 경로")
-    ap.add_argument("--telegram-lines", type=int, default=25, help="텔레그램용 요약 라인 수 (기본 25)")
+    ap.add_argument("--telegram-lines", type=int, default=25, help="텔레그램용 요약 라인 수")
 
     args = ap.parse_args()
     require_ma20 = not args.no_ma20
