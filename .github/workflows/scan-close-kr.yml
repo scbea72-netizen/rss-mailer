@@ -1,0 +1,61 @@
+name: KR Close Scan (Finalists)
+
+on:
+  schedule:
+    # Mon-Fri 16:10 KST = 07:10 UTC
+    - cron: "10 7 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run KR close scan
+        run: |
+          python scan_close_kr.py \
+            --min-change 2 \
+            --rsi-min 55 \
+            --top 60 \
+            --out-text out/scan_close_kr.txt \
+            --out-json out/scan_close_kr.json
+
+      # ✅ 결과를 Actions에서 바로 다운로드 가능하게 아티팩트로 올림
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kr-close-scan
+          path: out/
+
+      # ✅ (옵션) 텔레그램 알림: 시크릿이 있을 때만 발송
+      - name: Telegram notify (optional)
+        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
+        run: |
+          python - << 'PY'
+          import json, os, urllib.parse, urllib.request
+          p = json.load(open("out/scan_close_kr.json", "r", encoding="utf-8"))
+          msg = p.get("telegram_preview") or p.get("meta", {}).get("header", "KR CLOSE SCAN")
+          msg = msg[:3500]  # 텔레그램 안전 길이
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          data = urllib.parse.urlencode({"chat_id": chat_id, "text": msg}).encode()
+          urllib.request.urlopen(url, data=data, timeout=30).read()
+          print("Telegram sent")
+          PY
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
