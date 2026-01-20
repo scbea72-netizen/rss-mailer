@@ -43,23 +43,45 @@ jobs:
           name: kr-close-scan
           path: out/
 
-      - name: Telegram notify (optional)
+       - name: Telegram notify (safe)
+        continue-on-error: true   # ⭐ 실패해도 전체 워크플로우 성공
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python - << 'PY'
           import json, os, sys, urllib.parse, urllib.request
+
           token = os.getenv("TELEGRAM_BOT_TOKEN","")
           chat_id = os.getenv("TELEGRAM_CHAT_ID","")
+
           if not token or not chat_id:
               print("Telegram secrets not set. Skip.")
               sys.exit(0)
+
           p = json.load(open("out/scan_close_kr.json","r",encoding="utf-8"))
-          msg = p.get("telegram_preview") or p.get("meta",{}).get("header","KR CLOSE SCAN")
-          msg = msg[:3500]
+
+          # 🔹 메시지는 짧고 안전하게
+          header = p["meta"]["header"]
+          items = p.get("items", [])[:5]
+
+          lines = [header, "", "TOP PICKS"]
+          for i, it in enumerate(items, 1):
+              lines.append(
+                  f"{i}. {it['name']} ({it['code']}) | "
+                  f"{it['chg%']:.1f}% | RSI {it['rsi14']:.1f} | SCORE {it['score']}"
+              )
+
+          msg = "\n".join(lines)
+          msg = msg[:3000]  # 텔레그램 안전 길이
+
           url = f"https://api.telegram.org/bot{token}/sendMessage"
-          data = urllib.parse.urlencode({"chat_id": chat_id, "text": msg}).encode()
+          data = urllib.parse.urlencode({
+              "chat_id": chat_id,
+              "text": msg
+          }).encode("utf-8")
+
           urllib.request.urlopen(url, data=data, timeout=30).read()
           print("Telegram sent")
           PY
+
