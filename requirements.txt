@@ -2,3 +2,5 @@ requests
 yfinance
 pandas
 feedparser
+FinanceDataReader
+numpy
