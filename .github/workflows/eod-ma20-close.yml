@@ -24,12 +24,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests
 
-      # ✅ (선택) 값이 제대로 들어오는지 확인용 (secret 값은 출력되지 않음)
       - name: Check required env
         run: |
           python - << 'PY'
           import os
-          keys = ["EOD_API_KEY","GMAIL_USER","GMAIL_APP_PASS","HANMAIL_TO"]
+          keys = ["EOD_API_KEY","GMAIL_USER","GMAIL_APP_PASS","HANMAIL_TO","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"]
           for k in keys:
             v = os.getenv(k, "")
             print(f"{k}={'OK' if v else 'MISSING'}")
@@ -39,16 +38,20 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           HANMAIL_TO: ${{ secrets.HANMAIL_TO }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      - name: Run EOD scan
+      - name: Run EOD scan (Mail + Telegram)
         timeout-minutes: 15
         env:
           EOD_API_KEY: ${{ secrets.EOD_API_KEY }}
 
-          # ✅ 여기 3개가 “반드시” 들어가야 함
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           HANMAIL_TO: ${{ secrets.HANMAIL_TO }}
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
