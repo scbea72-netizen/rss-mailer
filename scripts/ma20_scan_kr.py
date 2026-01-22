@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from scripts.utils_krx import recent_trading_days, fetch_bulk_ohlcv_for_date
-from scripts.notify import send_email, send_telegram
+from utils_krx import recent_trading_days, fetch_bulk_ohlcv_for_date
+from notify import send_email, send_telegram
 
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
