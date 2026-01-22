@@ -1,9 +1,8 @@
-name: RSS Digest Mailer (Hanmail)
+name: RSS Digest Mailer (Gmail → Hanmail)
 
 on:
   schedule:
-    # Every 45 minutes (KST). GitHub Actions uses UTC for cron.
-    # KST = UTC+9, so this is every 45 minutes in UTC as well.
+    # Every 45 minutes (GitHub Actions cron uses UTC)
     - cron: "*/45 * * * *"
   workflow_dispatch:
 
@@ -25,16 +24,13 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+      # 🔥 여기서 Gmail 시크릿을 명시적으로 주입 (핵심)
       - name: Run digest
-        run: python rss_digest.py
         env:
-          # --- Hanmail (Daum) SMTP ---
-          SMTP_HOST: "smtp.daum.net"
-          SMTP_PORT: "465"
-          SMTP_USER: ${{ secrets.HANMAIL_USER }}
-          SMTP_PASS: ${{ secrets.HANMAIL_PASS }}
-          MAIL_FROM: ${{ secrets.HANMAIL_FROM }}
-          MAIL_TO: ${{ secrets.HANMAIL_TO }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
+          HANMAIL_TO: ${{ secrets.HANMAIL_TO }}
+          SUBJECT_PREFIX: "[RSS]"
+        run: |
+          python rss_digest.py
 
-          # Optional: translation (titles only)
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
