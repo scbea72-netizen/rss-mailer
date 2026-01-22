@@ -1,3 +1,4 @@
-# DO NOT USE.
-# Use requirements_rss.txt for RSS workflow
-# Use requirements_krx.txt for KRX MA20 workflow
+# DO NOT USE THIS FILE.
+# - RSS workflow uses: requirements_rss.txt
+# - KRX workflow uses: requirements_krx.txt
+# - KIS workflow uses: requirements_kis.txt
