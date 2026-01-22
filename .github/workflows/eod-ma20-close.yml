@@ -24,12 +24,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests
 
+      # ✅ (선택) 값이 제대로 들어오는지 확인용 (secret 값은 출력되지 않음)
+      - name: Check required env
+        run: |
+          python - << 'PY'
+          import os
+          keys = ["EOD_API_KEY","GMAIL_USER","GMAIL_APP_PASS","HANMAIL_TO"]
+          for k in keys:
+            v = os.getenv(k, "")
+            print(f"{k}={'OK' if v else 'MISSING'}")
+          PY
+        env:
+          EOD_API_KEY: ${{ secrets.EOD_API_KEY }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
+          HANMAIL_TO: ${{ secrets.HANMAIL_TO }}
+
       - name: Run EOD scan
         timeout-minutes: 15
         env:
           EOD_API_KEY: ${{ secrets.EOD_API_KEY }}
 
-          # ✅ 메일 관련 공통 ENV (여기가 빠져서 지금 에러난 것)
+          # ✅ 여기 3개가 “반드시” 들어가야 함
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           HANMAIL_TO: ${{ secrets.HANMAIL_TO }}
