@@ -2,18 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-rss_digest.py (RSS 뉴스 메일러 – 최종 안정판)
+rss_digest.py (RSS 뉴스 메일러 – 최종 안정판 / 시크릿 자동매핑)
 
 정책
 - KR: 제목 그대로
 - US / JP: 제목만 한글 번역 (MyMemory 무료)
 - 본문 번역 없음 (링크만)
 - 번역 실패해도 메일은 무조건 발송
+
+개선(중요)
+- GitHub Secrets 이름이 SMTP_*가 아니어도 자동 인식:
+  SMTP_* 우선 → HANMAIL_* → GMAIL_* 순으로 fallback
+- SMTP 인증 실패(535)는 fallback으로 해결 안 되므로,
+  원인 안내 메시지를 명확히 출력
+- SSL(465) 우선, 네트워크 이슈일 때만 STARTTLS(587) 시도
 """
 
 from __future__ import annotations
 
-import os, re, json, time, hashlib, traceback
+import os, json, time, hashlib, traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -38,7 +45,7 @@ MAX_KR = int(os.getenv("MAX_KR", "25"))
 MAX_JP = int(os.getenv("MAX_JP", "25"))
 MAX_ITEMS_PER_EMAIL = int(os.getenv("MAX_ITEMS_PER_EMAIL", "120"))
 
-TITLE_TRANSLATE = os.getenv("TITLE_TRANSLATE", "1") == "1"
+TITLE_TRANSLATE = os.getenv("TITLE_TRANSLATE", "1").strip() in ("1", "true", "yes", "on")
 TRANSLATE_SLEEP_SECONDS = float(os.getenv("TRANSLATE_SLEEP_SECONDS", "1.0"))
 
 USER_AGENT = os.getenv(
@@ -73,15 +80,28 @@ FEEDS = [
 ]
 
 # =====================
-# 3. SMTP
+# 3. SMTP / Mail (AUTO-MAP)
 # =====================
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.daum.net")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASS = os.getenv("SMTP_PASS")
-MAIL_TO = os.getenv("MAIL_TO", SMTP_USER)
-MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
-SUBJECT_PREFIX = os.getenv("SUBJECT_PREFIX", "[RSS]")
+def _env_any(*keys: str, default: str = "") -> str:
+    for k in keys:
+        v = os.getenv(k)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
+
+# Host/Port: SMTP_HOST 우선, 없으면 HANMAIL용 기본값
+SMTP_HOST = _env_any("SMTP_HOST", "HANMAIL_SMTP_HOST", default="smtp.daum.net")
+SMTP_PORT = int(_env_any("SMTP_PORT", "HANMAIL_SMTP_PORT", default="465"))
+
+# ✅ 계정/비번: SMTP_* 우선 → HANMAIL_* → GMAIL_* 순
+SMTP_USER = _env_any("SMTP_USER", "HANMAIL_USER", "GMAIL_USER", default="")
+SMTP_PASS = _env_any("SMTP_PASS", "HANMAIL_PASS", "GMAIL_APP_PASS", default="")
+
+# ✅ 수신/발신: MAIL_* 우선 → HANMAIL_* → 기본 SMTP_USER
+MAIL_TO   = _env_any("MAIL_TO", "HANMAIL_TO", default=SMTP_USER)
+MAIL_FROM = _env_any("MAIL_FROM", "HANMAIL_FROM", default=SMTP_USER)
+
+SUBJECT_PREFIX = _env_any("SUBJECT_PREFIX", default="[RSS]")
 
 # =====================
 # 4. CACHE
@@ -93,8 +113,8 @@ def load_json(p: Path) -> Dict:
     if p.exists():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
-        except:
-            pass
+        except Exception:
+            return {}
     return {}
 
 def save_json(p: Path, d: Dict):
@@ -105,20 +125,22 @@ def save_json(p: Path, d: Dict):
 # 5. UTIL
 # =====================
 def canonical(url: str) -> str:
-    u = urlparse(url)
-    qs = "&".join(
-        p for p in u.query.split("&")
-        if not p.lower().startswith("utm_")
-    )
-    return urlunparse(u._replace(query=qs, fragment=""))
+    try:
+        u = urlparse(url)
+        qs = "&".join(
+            p for p in (u.query or "").split("&") if p and not p.lower().startswith("utm_")
+        )
+        return urlunparse(u._replace(query=qs, fragment=""))
+    except Exception:
+        return url
 
 def parse_time(e) -> Optional[datetime]:
     for k in ("published", "updated"):
-        if e.get(k):
+        if getattr(e, "get", None) and e.get(k):
             try:
                 d = dtparser.parse(e[k])
                 return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
-            except:
+            except Exception:
                 pass
     return None
 
@@ -132,47 +154,52 @@ def looks_ja(s: str) -> bool:
 # 6. TRANSLATE
 # =====================
 def translate_title(text: str, cache: Dict[str, str]) -> str:
-    if has_ko(text):
-        return text
+    t = (text or "").strip()
+    if not t:
+        return t
+    if has_ko(t):
+        return t
 
-    src = "ja" if looks_ja(text) else "en"
-    key = f"{src}|{text}"
+    src = "ja" if looks_ja(t) else "en"
+    key = f"{src}|{t}"
     if key in cache:
         return cache[key]
 
+    out = t
     try:
         r = SESSION.get(
             "https://api.mymemory.translated.net/get",
-            params={"q": text, "langpair": f"{src}|ko"},
+            params={"q": t, "langpair": f"{src}|ko"},
             timeout=REQUEST_TIMEOUT
         )
-        out = r.json().get("responseData", {}).get("translatedText", text)
-    except:
-        out = text
+        out = (r.json() or {}).get("responseData", {}).get("translatedText") or t
+        out = str(out).strip() or t
+    except Exception:
+        out = t
 
     cache[key] = out
-    time.sleep(TRANSLATE_SLEEP_SECONDS)
+    if TRANSLATE_SLEEP_SECONDS > 0:
+        time.sleep(TRANSLATE_SLEEP_SECONDS)
     return out
 
 # =====================
 # 7. FETCH
 # =====================
-def fetch(feed):
-    items = []
+def fetch(feed: Dict[str, str]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
     try:
-        parsed = feedparser.parse(
-            feed["url"],
-            request_headers={"User-Agent": USER_AGENT}
-        )
+        parsed = feedparser.parse(feed["url"], request_headers={"User-Agent": USER_AGENT})
         for e in parsed.entries[:MAX_ITEMS_PER_FEED]:
-            if not e.get("title") or not e.get("link"):
+            title = (e.get("title") or "").strip()
+            link = (e.get("link") or "").strip()
+            if not title or not link:
                 continue
             items.append({
                 "category": feed["category"],
                 "feed": feed["name"],
-                "title": e.title.strip(),
-                "link": canonical(e.link.strip()),
-                "time": parse_time(e)
+                "title": title,
+                "link": canonical(link),
+                "time": parse_time(e),
             })
     except Exception:
         traceback.print_exc()
@@ -181,7 +208,7 @@ def fetch(feed):
 # =====================
 # 8. MAIL HTML
 # =====================
-def build_html(items, title_cache):
+def build_html(items: List[Dict[str, Any]], title_cache: Dict[str, str]) -> str:
     out = [f"<h2>{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}</h2><hr/>"]
     for cat in ("US", "KR", "JP"):
         group = [x for x in items if x["category"] == cat]
@@ -197,18 +224,50 @@ def build_html(items, title_cache):
     return "\n".join(out)
 
 # =====================
-# 9. SEND
+# 9. SEND (ROBUST)
 # =====================
-def send(subject, html):
+def send(subject: str, html: str) -> None:
+    if not SMTP_USER or not SMTP_PASS:
+        raise RuntimeError(
+            "SMTP 계정 정보가 비어있음. "
+            "GitHub Secrets에 HANMAIL_USER/HANMAIL_PASS 또는 SMTP_USER/SMTP_PASS 또는 GMAIL_USER/GMAIL_APP_PASS를 설정하세요."
+        )
+    if not MAIL_TO:
+        raise RuntimeError("수신자(MAIL_TO/HANMAIL_TO)가 비어있음")
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = MAIL_FROM
+    msg["From"] = MAIL_FROM or SMTP_USER
     msg["To"] = MAIL_TO
     msg.attach(MIMEText(html, "html", "utf-8"))
 
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
-        s.login(SMTP_USER, SMTP_PASS)
-        s.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
+    # 1) SSL 우선
+    try:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(msg["From"], [MAIL_TO], msg.as_string())
+            return
+
+    except smtplib.SMTPAuthenticationError as e:
+        # ✅ 535는 보통 앱비밀번호/비번오류/SMTP허용 OFF
+        raise RuntimeError(
+            "SMTP 인증 실패(535). "
+            "HANMAIL_PASS가 '앱 비밀번호'인지 확인하고, HANMAIL_USER가 전체 이메일 주소인지 확인하세요. "
+            "또한 한메일 계정 보안설정에서 외부앱(SMTP) 허용/앱비밀번호 발급이 필요할 수 있습니다."
+        ) from e
+
+    except Exception:
+        # 2) 네트워크/포트 이슈일 때만 STARTTLS fallback
+        try:
+            with smtplib.SMTP(SMTP_HOST, 587, timeout=30) as s:
+                s.ehlo()
+                s.starttls()
+                s.ehlo()
+                s.login(SMTP_USER, SMTP_PASS)
+                s.sendmail(msg["From"], [MAIL_TO], msg.as_string())
+                return
+        except Exception as e2:
+            raise RuntimeError(f"SMTP 전송 실패(SSL/STARTTLS 모두 실패): {e2}") from e2
 
 # =====================
 # 10. MAIN
@@ -217,36 +276,53 @@ def main():
     sent = load_json(CACHE_PATH)
     title_cache = load_json(TITLE_CACHE_PATH)
 
-    items = []
+    # 1) 수집
+    items: List[Dict[str, Any]] = []
     for f in FEEDS:
         items.extend(fetch(f))
 
-    fresh = []
+    # 2) 너무 오래된 뉴스 제거(옵션)
+    if MAX_AGE_HOURS > 0:
+        cutoff = datetime.now(timezone.utc).timestamp() - MAX_AGE_HOURS * 3600
+        items = [it for it in items if not it["time"] or it["time"].timestamp() >= cutoff]
+
+    # 3) 신규만 남기기
+    fresh: List[Dict[str, Any]] = []
     for it in items:
-        key = hashlib.sha1(f"{it['title']}{it['link']}".encode()).hexdigest()
+        key = hashlib.sha1(f"{it['title']}{it['link']}".encode("utf-8", "ignore")).hexdigest()
         if key in sent:
             continue
         sent[key] = time.time()
         fresh.append(it)
 
-    fresh.sort(key=lambda x: x["time"] or datetime.min, reverse=True)
-    fresh = (
-        [x for x in fresh if x["category"] == "US"][:MAX_US] +
-        [x for x in fresh if x["category"] == "KR"][:MAX_KR] +
-        [x for x in fresh if x["category"] == "JP"][:MAX_JP]
-    )
+    # 4) 최신순 정렬
+    fresh.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
 
-    if not fresh:
+    # 5) 국가별 상한
+    us = [x for x in fresh if x["category"] == "US"][:MAX_US]
+    kr = [x for x in fresh if x["category"] == "KR"][:MAX_KR]
+    jp = [x for x in fresh if x["category"] == "JP"][:MAX_JP]
+    combined = us + kr + jp
+    combined.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
+
+    if MAX_ITEMS_PER_EMAIL > 0 and len(combined) > MAX_ITEMS_PER_EMAIL:
+        combined = combined[:MAX_ITEMS_PER_EMAIL]
+
+    if not combined:
         print("NO NEW ITEMS")
+        save_json(CACHE_PATH, sent)
+        save_json(TITLE_CACHE_PATH, title_cache)
         return
 
-    html = build_html(fresh, title_cache)
-    send(f"{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}", html)
+    html = build_html(combined, title_cache)
+    subject = f"{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    send(subject, html)
 
     save_json(CACHE_PATH, sent)
     save_json(TITLE_CACHE_PATH, title_cache)
 
-    print(f"SENT {len(fresh)} ITEMS")
+    print(f"SENT {len(combined)} ITEMS | US={len(us)} KR={len(kr)} JP={len(jp)}")
+    print(f"SMTP_HOST={SMTP_HOST} PORT={SMTP_PORT} USER={(SMTP_USER[:3] + '***') if SMTP_USER else 'EMPTY'} TO={MAIL_TO}")
 
 if __name__ == "__main__":
     main()
