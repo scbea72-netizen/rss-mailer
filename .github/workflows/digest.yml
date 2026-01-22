@@ -1,16 +1,15 @@
-name: RSS Digest Mailer (Manual Only)
+name: RSS Digest Mailer (Hanmail)
 
 on:
+  schedule:
+    # Every 45 minutes (KST). GitHub Actions uses UTC for cron.
+    # KST = UTC+9, so this is every 45 minutes in UTC as well.
+    - cron: "*/45 * * * *"
   workflow_dispatch:
-
-concurrency:
-  group: rss-digest-mailer
-  cancel-in-progress: true
 
 jobs:
   send-digest:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -24,42 +23,18 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Restore cache (dedupe + title translate)
-        uses: actions/cache@v4
-        with:
-          path: |
-            .cache/rss
-          key: rss-digest-cache
-          restore-keys: |
-            rss-digest-cache
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run digest
+        run: python rss_digest.py
         env:
-          # ✅ 이 워크플로는 “수동 테스트용”으로만 유지 (자동발송은 News Digest -> Hanmail이 담당)
+          # --- Hanmail (Daum) SMTP ---
           SMTP_HOST: "smtp.daum.net"
           SMTP_PORT: "465"
           SMTP_USER: ${{ secrets.HANMAIL_USER }}
           SMTP_PASS: ${{ secrets.HANMAIL_PASS }}
-          MAIL_TO:   ${{ secrets.HANMAIL_TO }}
           MAIL_FROM: ${{ secrets.HANMAIL_FROM }}
+          MAIL_TO: ${{ secrets.HANMAIL_TO }}
 
-          REQUEST_TIMEOUT: "15"
-          BATCH_WINDOW_SECONDS: "0"
-          MAX_AGE_HOURS: "48"
-          MAX_ITEMS_PER_FEED: "50"
-
-          MAX_ITEMS_PER_EMAIL: "120"
-          MAX_US: "25"
-          MAX_KR: "25"
-          MAX_JP: "25"
-
-          TITLE_TRANSLATE: "1"
-          TITLE_TRANSLATE_PROVIDER: "mymemory"
-          TRANSLATE_SLEEP_SECONDS: "1.0"
-
-          JP_KEYWORD_MODE: "0"
-          RESOLVE_FINAL_URL: "0"
-        run: |
-          python rss_digest.py
+          # Optional: translation (titles only)
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
