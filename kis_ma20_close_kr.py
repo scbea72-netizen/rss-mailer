@@ -30,7 +30,7 @@ TG_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 TOPN = int(os.getenv("TOPN", "30"))
 
-# ✅ 현실형 기본값
+# ✅ 현실형 기본값 (0개 방지 방향)
 VOL_MULT = float(os.getenv("VOL_MULT", "0.7"))          # 평균 거래량의 70%만 넘어도 통과
 NEAR_PCT = float(os.getenv("NEAR_PCT", "0.012"))        # ±1.2%
 
@@ -41,9 +41,6 @@ BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "3"))
 ABOVE_MIN_PCT = float(os.getenv("ABOVE_MIN_PCT", "0.003"))  # +0.3% 이상
 ABOVE_MAX_PCT = float(os.getenv("ABOVE_MAX_PCT", "0.05"))   # +5% 이내
 ABOVE_VOL_MULT = float(os.getenv("ABOVE_VOL_MULT", "0.6"))  # 평균의 60%만 넘어도
-
-TEST_LIMIT = int(os.getenv("TEST_LIMIT", "400"))
-FULL_SCAN = os.getenv("FULL_SCAN", "0").strip() == "1"
 
 REQ_TIMEOUT = int(os.getenv("REQ_TIMEOUT", "15"))
 MST_TIMEOUT = int(os.getenv("MST_TIMEOUT", "60"))
@@ -180,9 +177,6 @@ def load_mst(zip_bytes):
 
 
 def get_universe_with_market():
-    """
-    ✅ 코스피/코스닥 구분용: code -> market 맵 구성
-    """
     kospi = load_mst(download_mst(KOSPI_URL))
     kosdaq = load_mst(download_mst(KOSDAQ_URL))
 
@@ -403,9 +397,8 @@ def main():
     print("[START] load universe", flush=True)
     codes, name_map, market_map = get_universe_with_market()
 
+    # ✅ 전종목 스캔 강제 (if/else 제거로 오류 원천 차단)
     print(f"[MODE] FULL_SCAN FORCED (TOTAL={len(codes)})", flush=True)
-    else:
-        print(f"[MODE] FULL_SCAN=1 (TOTAL={len(codes)})", flush=True)
 
     hits_b, hits_n, hits_a = [], [], []
     industry_cache = {}
@@ -454,10 +447,10 @@ def main():
         if i % SLEEP_EVERY == 0:
             time.sleep(SLEEP_SEC)
 
-    # 전체에서 먼저 정리
+    # 전체 기준 우선순위 정리
     hits_b, hits_n, hits_a = sort_and_dedupe(hits_b, hits_n, hits_a)
 
-    # 시장별로 분리 후 각 시장 내에서 다시 TOPN 보장
+    # 시장별 분리 후 TOPN
     kospi_b, kosdaq_b = split_by_market(hits_b)
     kospi_n, kosdaq_n = split_by_market(hits_n)
     kospi_a, kosdaq_a = split_by_market(hits_a)
@@ -472,7 +465,11 @@ def main():
         flush=True
     )
 
-    subject, body = send_mail(kospi_b, kospi_n, kospi_a, kosdaq_b, kosdaq_n, kosdaq_a)
+    subject, body = send_mail(
+        kospi_b, kospi_n, kospi_a,
+        kosdaq_b, kosdaq_n, kosdaq_a
+    )
+
     _ = tg_send(subject + "\n" + body)
     print("[OK] done", flush=True)
 
