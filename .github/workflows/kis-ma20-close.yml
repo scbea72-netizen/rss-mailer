@@ -1,16 +1,21 @@
 name: KIS MA20 Close Mail (KR)
 
 on:
-  schedule:
-    - cron: "55 6 * * 1-5"   # 15:55 KST
   workflow_dispatch:
+  schedule:
+    - cron: "30 6 * * 1-5"  # 평일 15:30 KST (UTC 06:30)
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 25  # ✅ job 전체 무한 방지
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -20,22 +25,34 @@ jobs:
           pip install pandas requests
 
       - name: Run MA20 Entry & Send Mail
-        run: python kis_ma20_close_kr.py
+        timeout-minutes: 20  # ✅ step 무한 방지
         env:
-          # KIS
           KIS_APPKEY: ${{ secrets.KIS_APPKEY }}
           KIS_APPSECRET: ${{ secrets.KIS_APPSECRET }}
           KIS_BASE_URL: ${{ secrets.KIS_BASE_URL }}
           KIS_KOSPI_MST_URL: ${{ secrets.KIS_KOSPI_MST_URL }}
           KIS_KOSDAQ_MST_URL: ${{ secrets.KIS_KOSDAQ_MST_URL }}
 
-          # Gmail SMTP (fixed values to avoid blank/space secrets causing int() errors)
-          SMTP_HOST: "smtp.gmail.com"
-          SMTP_PORT: "587"
-          SMTP_USER: ${{ secrets.GMAIL_USER }}
-          SMTP_PASS: ${{ secrets.GMAIL_APP_PASS }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
+          HANMAIL_TO: ${{ secrets.HANMAIL_TO }}
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "465"
 
-          # Params
           TOPN: "30"
-          VOL_MULT: "1.2"
+          VOL_MULT: "1.0"
+          NEAR_PCT: "0.005"
+
+          # ✅ 처음엔 테스트 모드 권장
+          FULL_SCAN: "0"
+          TEST_LIMIT: "400"
+
+          # ✅ 네트워크 안전장치
+          REQ_TIMEOUT: "15"
+          MAX_RETRY: "2"
+          RETRY_SLEEP: "0.6"
+          SLEEP_EVERY: "25"
+          SLEEP_SEC: "0.35"
+
+        run: |
+          python kis_ma20_close_kr.py
