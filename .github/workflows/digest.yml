@@ -40,12 +40,13 @@ jobs:
 
       - name: Run digest
         env:
-          # 메일 발송 (Secrets에 있어야 함)
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          MAIL_TO:   ${{ secrets.MAIL_TO }}
+          # ✅ 한메일로 강제 고정 (여기서 결정됨)
+          SMTP_HOST: "smtp.daum.net"
+          SMTP_PORT: "465"
+          SMTP_USER: ${{ secrets.HANMAIL_USER }}
+          SMTP_PASS: ${{ secrets.HANMAIL_PASS }}
+          MAIL_TO:   ${{ secrets.HANMAIL_TO }}
+          MAIL_FROM: ${{ secrets.HANMAIL_FROM }}
 
           # 안정 옵션
           REQUEST_TIMEOUT: "15"
@@ -71,4 +72,3 @@ jobs:
           RESOLVE_FINAL_URL: "0"
         run: |
           python rss_digest.py
-
