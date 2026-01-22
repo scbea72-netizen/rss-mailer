@@ -22,17 +22,20 @@ jobs:
       - name: Run MA20 Entry & Send Mail
         run: python kis_ma20_close_kr.py
         env:
+          # KIS
           KIS_APPKEY: ${{ secrets.KIS_APPKEY }}
           KIS_APPSECRET: ${{ secrets.KIS_APPSECRET }}
           KIS_BASE_URL: ${{ secrets.KIS_BASE_URL }}
           KIS_KOSPI_MST_URL: ${{ secrets.KIS_KOSPI_MST_URL }}
           KIS_KOSDAQ_MST_URL: ${{ secrets.KIS_KOSDAQ_MST_URL }}
 
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          # Gmail SMTP (fixed values to avoid blank/space secrets causing int() errors)
+          SMTP_HOST: "smtp.gmail.com"
+          SMTP_PORT: "587"
+          SMTP_USER: ${{ secrets.GMAIL_USER }}
+          SMTP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
 
+          # Params
           TOPN: "30"
           VOL_MULT: "1.2"
