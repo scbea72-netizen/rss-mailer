@@ -1,6 +1,4 @@
-pandas>=1.5,<3.0
-numpy>=1.23,<2.0
-yfinance>=0.2
-finance-datareader
-feedparser
-exchange_calendars
+pandas==2.2.3
+pykrx==1.0.48
+requests==2.32.3
+python-dateutil==2.9.0.post0
