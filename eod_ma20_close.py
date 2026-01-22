@@ -67,4 +67,88 @@ def fetch_eod(symbol):
 def scan(symbol, market):
     try:
         df = fetch_eod(symbol)
-        if len(
+        if len(df) < 25:
+            return None
+
+        close = df["close"]
+        ma20 = close.rolling(20).mean()
+
+        c0, c1 = close.iloc[-1], close.iloc[-2]
+        m0, m1 = ma20.iloc[-1], ma20.iloc[-2]
+
+        breakout = (c1 < m1) and (c0 >= m0)
+        near = abs(c0 / m0 - 1) <= NEAR_PCT
+
+        if not (breakout or near):
+            return None
+
+        return {
+            "symbol": symbol,
+            "market": market,
+            "close": round(float(c0), 2),
+            "ma20": round(float(m0), 2),
+            "pct": round((float(c0) / float(m0) - 1) * 100, 2),
+            "type": "돌파" if breakout else "근접",
+        }
+    except Exception as e:
+        print(f"[SKIP] {market}:{symbol} err={type(e).__name__}", flush=True)
+        return None
+
+def send_mail(rows):
+    if not rows:
+        print("[MAIL] no rows -> skip", flush=True)
+        return
+
+    to_list = parse_recipients(MAIL_TO_RAW)
+    if not to_list:
+        raise RuntimeError("HANMAIL_TO invalid")
+
+    rows = sorted(rows, key=lambda x: (x["type"] != "돌파", -x["pct"]))
+
+    subject = f"[미국·일본] MA20 돌파·근접 {len(rows)}종목"
+    lines = [
+        f"[{r['market']}] {r['symbol']} | {r['type']} | 종가 {r['close']} | MA20 {r['ma20']} | {r['pct']}%"
+        for r in rows
+    ]
+    body = "\n".join(lines)
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = MAIL_FROM
+    msg["To"] = ", ".join(to_list)
+
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
+        s.login(SMTP_USER, SMTP_PASS)
+        s.sendmail(MAIL_FROM, to_list, msg.as_string())
+
+    print(f"[MAIL] sent ok -> {to_list}", flush=True)
+    return subject, body
+
+def main():
+    require_env()
+    print("[START] EOD MA20 US/JP scan", flush=True)
+
+    results = []
+
+    for i, s in enumerate(US_LIST, 1):
+        print(f"[US] {i}/{len(US_LIST)} {s}", flush=True)
+        r = scan(s, "US")
+        if r: results.append(r)
+        time.sleep(0.2)
+
+    for i, s in enumerate(JP_LIST, 1):
+        print(f"[JP] {i}/{len(JP_LIST)} {s}", flush=True)
+        r = scan(s, "JP")
+        if r: results.append(r)
+        time.sleep(0.2)
+
+    results = results[:TOPN]
+    out = send_mail(results)
+
+    # 텔레그램도 같이
+    if out:
+        subject, body = out
+        tg_send(subject + "\n" + body)
+
+if __name__ == "__main__":
+    main()
