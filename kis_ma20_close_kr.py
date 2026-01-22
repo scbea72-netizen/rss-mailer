@@ -403,9 +403,7 @@ def main():
     print("[START] load universe", flush=True)
     codes, name_map, market_map = get_universe_with_market()
 
-    if not FULL_SCAN:
-        codes = codes[:TEST_LIMIT]
-        print(f"[MODE] TEST_LIMIT={TEST_LIMIT} (FULL_SCAN=0)", flush=True)
+            print(f"[MODE] FULL_SCAN FORCED (TOTAL={len(codes)})", flush=True)
     else:
         print(f"[MODE] FULL_SCAN=1 (TOTAL={len(codes)})", flush=True)
 
