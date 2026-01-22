@@ -32,17 +32,38 @@ def _kst_business_asof_date(now: Optional[datetime] = None) -> str:
     return d.strftime("%Y%m%d")
 
 
+def _fallback_weekdays(n: int, asof: str, back_days: int = 120) -> List[str]:
+    """
+    ✅ 최후 fallback: 최근 '평일' 기준으로 날짜 후보를 만든다.
+    - 휴장일이 섞여도 이후 OHLCV 수집에서 스킵되도록 설계되어 있음
+    """
+    end = pd.Timestamp(asof).date()
+    start = (pd.Timestamp(asof) - pd.Timedelta(days=back_days)).date()
+
+    days = []
+    d = start
+    while d <= end:
+        if d.weekday() < 5:  # Mon~Fri
+            days.append(pd.Timestamp(d).strftime("%Y%m%d"))
+        d += timedelta(days=1)
+
+    if len(days) < n:
+        # back_days를 늘려도 되지만, 여기선 최대한 확보만 해두기
+        return days
+    return days[-n:]
+
+
 def recent_trading_days(n: int, end_date: str | None = None, back_days: int = 365) -> List[TradingDay]:
     """
-    ✅ exchange_calendars 제거 (timezone 이슈 원천 차단)
-    pykrx의 get_previous_business_days로 최근 거래일 n개를 반환.
+    ✅ 거래일 확보 로직(안깨짐)
+    1) 1순위: pykrx.get_previous_business_days (정상일 때 가장 정확)
+    2) 2순위: 실패/빈값이면 최근 '평일' 리스트로 fallback (휴장일은 이후 수집에서 스킵)
     """
     if n <= 0:
         return []
 
     # end_date 옵션 처리
     if end_date:
-        # YYYYMMDD / YYYY-MM-DD 모두 허용
         if "-" in end_date:
             asof = pd.Timestamp(end_date).strftime("%Y%m%d")
         else:
@@ -50,19 +71,27 @@ def recent_trading_days(n: int, end_date: str | None = None, back_days: int = 36
     else:
         asof = _kst_business_asof_date()
 
-    # 충분히 넉넉한 시작일 (back_days)
     start = (pd.Timestamp(asof) - pd.Timedelta(days=back_days)).strftime("%Y%m%d")
 
+    days = []
     try:
-        days = stock.get_previous_business_days(fromdate=start, todate=asof)
+        days = stock.get_previous_business_days(fromdate=start, todate=asof) or []
     except Exception as e:
-        raise RuntimeError(f"거래일 조회 실패: {e}")
+        print(f"[WARN] get_previous_business_days failed: {e}")
+        days = []
 
+    # ✅ pykrx가 빈 리스트를 주는 경우가 있어서 fallback
     if not days or len(days) < n:
-        raise RuntimeError(f"최근 거래일 {n}개를 확보하지 못했습니다. 확보={0 if not days else len(days)}")
+        print(f"[WARN] trading_days from pykrx is empty/insufficient. fallback to weekdays. got={len(days)} need={n}")
+        fb = _fallback_weekdays(n=n, asof=asof, back_days=max(120, n * 4))
+        if not fb or len(fb) < n:
+            # 그래도 부족하면 있는 만큼이라도 반환 (상위에서 스킵/부족 체크)
+            print(f"[WARN] fallback weekdays insufficient: got={0 if not fb else len(fb)} need={n}")
+            days = fb
+        else:
+            days = fb
 
-    days = days[-n:]
-    return [TradingDay(d) for d in days]
+    return [TradingDay(d) for d in days[-n:]]
 
 
 def _get_market_ohlcv_safe(date_yyyymmdd: str, market: str) -> pd.DataFrame | None:
