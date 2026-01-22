@@ -46,20 +46,103 @@ STATE_FILE = "state.json"
 TICKER_NAMES_FILE = "ticker_names.json"
 TICKER_NAME_MAX_FETCH = int(os.getenv("TICKER_NAME_MAX_FETCH", "300"))  # 한 번 실행당 신규 조회 상한(안정용)
 
+# 텔레그램 메시지 안전 제한(여유 있게 3800으로 분할)
+TG_MAX_LEN = int(os.getenv("TG_MAX_LEN", "3800"))
+
+
+def _split_message(text: str, max_len: int = TG_MAX_LEN) -> List[str]:
+    """
+    텔레그램 메시지 길이 제한 회피용 분할.
+    - 빈/공백만이면 빈 리스트 반환
+    - 줄 단위로 최대한 자연스럽게 나눔
+    """
+    if text is None:
+        return []
+    text = str(text).strip()
+    if not text:
+        return []
+
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: List[str] = []
+    lines = text.splitlines()
+    buf: List[str] = []
+    cur = 0
+
+    for line in lines:
+        add = (1 if buf else 0) + len(line)  # 줄바꿈 1 포함(버퍼에 이미 줄이 있을 때)
+        if cur + add <= max_len:
+            if buf:
+                buf.append(line)
+            else:
+                buf = [line]
+            cur += add
+            continue
+
+        # 현재 버퍼가 있으면 먼저 flush
+        if buf:
+            chunks.append("\n".join(buf).strip())
+            buf, cur = [], 0
+
+        # 한 줄이 너무 길면 강제로 자르기
+        if len(line) > max_len:
+            s = line
+            while len(s) > max_len:
+                chunks.append(s[:max_len].strip())
+                s = s[max_len:]
+            if s.strip():
+                buf = [s.strip()]
+                cur = len(buf[0])
+        else:
+            buf = [line]
+            cur = len(line)
+
+    if buf:
+        chunks.append("\n".join(buf).strip())
+
+    # 혹시라도 빈 조각 제거
+    return [c for c in chunks if c and c.strip()]
+
 
 def tg_send(chat_id: str, text: str) -> None:
+    """
+    ✅ 수정 포인트:
+    - text가 비어있으면 전송하지 않음(400 'message text is empty' 방지)
+    - 너무 길면 여러 개로 분할 전송
+    - 네트워크/API 오류는 로그 출력 후 raise (Actions 로그에서 확인)
+    """
     if not TG_BOT_TOKEN:
         raise RuntimeError("TG_BOT_TOKEN missing")
     if not chat_id:
         raise RuntimeError("chat_id missing")
+
+    parts = _split_message(text, TG_MAX_LEN)
+    if not parts:
+        print("[TG] skip: empty text")
+        return
+
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    r = requests.post(
-        url,
-        data={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
-        timeout=20
-    )
-    print("[TG] status:", r.status_code, "resp:", (r.text or "")[:200])
-    r.raise_for_status()
+
+    for i, part in enumerate(parts, 1):
+        payload = {
+            "chat_id": chat_id,
+            "text": part,
+            "disable_web_page_preview": True,
+        }
+        try:
+            r = requests.post(url, data=payload, timeout=20)
+            print(f"[TG] part {i}/{len(parts)} status:", r.status_code, "resp:", (r.text or "")[:200])
+            r.raise_for_status()
+        except requests.RequestException as e:
+            # 텔레그램이 내려준 본문이 있으면 같이 출력
+            try:
+                resp_text = getattr(e.response, "text", None)
+                if resp_text:
+                    print("[TG] error response:", resp_text[:500])
+            except Exception:
+                pass
+            raise
 
 
 def load_tickers(path: str) -> List[str]:
