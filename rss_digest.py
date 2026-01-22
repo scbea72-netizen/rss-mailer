@@ -2,20 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-rss_digest.py (RSS 뉴스 메일러 – 최종 안정판 / 시크릿 자동매핑 + 진단로그 강화)
-
-정책
+rss_digest.py (최종 고정본)
+- 메일 발송: Gmail SMTP (smtp.gmail.com)
+- 메일 수신: 한메일(HANMAIL_TO)
 - KR: 제목 그대로
-- US / JP: 제목만 한글 번역 (MyMemory 무료)
-- 본문 번역 없음 (링크만)
-- 번역 실패해도 메일은 무조건 발송
+- US/JP: 제목만 한글 번역 (MyMemory 무료)
+- 실패해도 원인 로그 명확히 출력
 
-개선(중요)
-- GitHub Secrets 이름이 SMTP_*가 아니어도 자동 인식:
-  SMTP_* 우선 → HANMAIL_* → GMAIL_* 순으로 fallback
-- SMTP 인증 실패(535)는 "대부분 계정/앱비번/허용설정" 문제라
-  원인 안내 메시지 + 진단 정보를 명확히 출력
-- SSL(465) 우선, 네트워크 이슈일 때만 STARTTLS(587) 시도
+필수 GitHub Secrets:
+- GMAIL_USER
+- GMAIL_APP_PASS
+- HANMAIL_TO
 """
 
 from __future__ import annotations
@@ -54,6 +51,8 @@ USER_AGENT = os.getenv(
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
+SUBJECT_PREFIX = os.getenv("SUBJECT_PREFIX", "[RSS]")
+
 # =====================
 # 1. HTTP
 # =====================
@@ -80,36 +79,24 @@ FEEDS = [
 ]
 
 # =====================
-# 3. SMTP / Mail (AUTO-MAP)
+# 3. SMTP (GMAIL 고정)
 # =====================
-def _env_any(*keys: str, default: str = "") -> str:
-    for k in keys:
-        v = os.getenv(k)
-        if v is not None and str(v).strip() != "":
-            return str(v).strip()
-    return default
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 465
+
+GMAIL_USER = (os.getenv("GMAIL_USER") or "").strip()
+GMAIL_APP_PASS = (os.getenv("GMAIL_APP_PASS") or "").strip()
+
+# 수신은 한메일로 고정(없으면 Gmail 본인에게라도 보냄)
+MAIL_TO = (os.getenv("HANMAIL_TO") or os.getenv("MAIL_TO") or GMAIL_USER).strip()
+MAIL_FROM = (os.getenv("MAIL_FROM") or GMAIL_USER).strip()
 
 def _mask(s: str, keep: int = 3) -> str:
     if not s:
         return "EMPTY"
-    s = str(s)
     if len(s) <= keep:
         return s[0] + "***"
     return s[:keep] + "***"
-
-# Host/Port: SMTP_HOST 우선, 없으면 HANMAIL용 기본값
-SMTP_HOST = _env_any("SMTP_HOST", "HANMAIL_SMTP_HOST", default="smtp.daum.net")
-SMTP_PORT = int(_env_any("SMTP_PORT", "HANMAIL_SMTP_PORT", default="465"))
-
-# ✅ 계정/비번: SMTP_* 우선 → HANMAIL_* → GMAIL_* 순
-SMTP_USER = _env_any("SMTP_USER", "HANMAIL_USER", "GMAIL_USER", default="")
-SMTP_PASS = _env_any("SMTP_PASS", "HANMAIL_PASS", "GMAIL_APP_PASS", default="")
-
-# ✅ 수신/발신: MAIL_* 우선 → HANMAIL_* → 기본 SMTP_USER
-MAIL_TO   = _env_any("MAIL_TO", "HANMAIL_TO", default=SMTP_USER)
-MAIL_FROM = _env_any("MAIL_FROM", "HANMAIL_FROM", default=SMTP_USER)
-
-SUBJECT_PREFIX = _env_any("SUBJECT_PREFIX", default="[RSS]")
 
 # =====================
 # 4. CACHE
@@ -159,7 +146,7 @@ def looks_ja(s: str) -> bool:
     return any(0x3040 <= ord(c) <= 0x30ff for c in s)
 
 # =====================
-# 6. TRANSLATE
+# 6. TRANSLATE (제목만)
 # =====================
 def translate_title(text: str, cache: Dict[str, str]) -> str:
     t = (text or "").strip()
@@ -236,55 +223,33 @@ def build_html(items: List[Dict[str, Any]], title_cache: Dict[str, str]) -> str:
     return "\n".join(out)
 
 # =====================
-# 9. SEND (ROBUST + DIAG)
+# 9. SEND (GMAIL SSL)
 # =====================
 def send(subject: str, html: str) -> None:
-    # 진단 정보(마스킹)
-    print(f"[DIAG] SMTP_HOST={SMTP_HOST} PORT={SMTP_PORT} USER={_mask(SMTP_USER)} TO={_mask(MAIL_TO)} FROM={_mask(MAIL_FROM)}")
+    print(f"[DIAG] SMTP={SMTP_HOST}:{SMTP_PORT} FROM={_mask(MAIL_FROM)} TO={_mask(MAIL_TO)} USER={_mask(GMAIL_USER)}")
 
-    if not SMTP_USER or not SMTP_PASS:
-        raise RuntimeError(
-            "SMTP 계정 정보가 비어있음. "
-            "GitHub Secrets에 HANMAIL_USER/HANMAIL_PASS(권장) 또는 SMTP_USER/SMTP_PASS 또는 GMAIL_USER/GMAIL_APP_PASS를 설정하세요."
-        )
+    if not GMAIL_USER or not GMAIL_APP_PASS:
+        raise RuntimeError("GMAIL_USER 또는 GMAIL_APP_PASS가 비어있음 (GitHub Secrets 확인)")
     if not MAIL_TO:
-        raise RuntimeError("수신자(MAIL_TO/HANMAIL_TO)가 비어있음")
+        raise RuntimeError("HANMAIL_TO(수신 한메일)가 비어있음 (GitHub Secrets 확인)")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = MAIL_FROM or SMTP_USER
+    msg["From"] = MAIL_FROM
     msg["To"] = MAIL_TO
     msg.attach(MIMEText(html, "html", "utf-8"))
 
-    # 1) SSL 우선
+    # Gmail: SSL(465) 고정
     try:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
-            s.login(SMTP_USER, SMTP_PASS)
-            s.sendmail(msg["From"], [MAIL_TO], msg.as_string())
-            print("[OK] SMTP_SSL sent")
-            return
-
+            s.login(GMAIL_USER, GMAIL_APP_PASS)
+            s.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
+        print("[OK] Gmail SMTP sent")
     except smtplib.SMTPAuthenticationError as e:
         raise RuntimeError(
-            "SMTP 인증 실패(535). "
-            "① HANMAIL_USER가 전체 이메일 주소인지 확인 "
-            "② HANMAIL_PASS가 '앱 비밀번호'인지 확인 "
-            "③ 한메일 계정 보안설정에서 외부앱(SMTP) 허용/앱비밀번호 발급 필요할 수 있음"
+            "Gmail SMTP 인증 실패(535). "
+            "GMAIL_APP_PASS는 '앱 비밀번호'여야 합니다(구글 2단계 인증 후 발급)."
         ) from e
-
-    except Exception:
-        # 2) 네트워크/포트 이슈일 때만 STARTTLS fallback
-        try:
-            with smtplib.SMTP(SMTP_HOST, 587, timeout=30) as s:
-                s.ehlo()
-                s.starttls()
-                s.ehlo()
-                s.login(SMTP_USER, SMTP_PASS)
-                s.sendmail(msg["From"], [MAIL_TO], msg.as_string())
-                print("[OK] STARTTLS sent")
-                return
-        except Exception as e2:
-            raise RuntimeError(f"SMTP 전송 실패(SSL/STARTTLS 모두 실패): {e2}") from e2
 
 # =====================
 # 10. MAIN
@@ -298,12 +263,12 @@ def main():
     for f in FEEDS:
         items.extend(fetch(f))
 
-    # 2) 너무 오래된 뉴스 제거
+    # 2) 오래된 뉴스 제거
     if MAX_AGE_HOURS > 0:
         cutoff = datetime.now(timezone.utc).timestamp() - MAX_AGE_HOURS * 3600
         items = [it for it in items if not it["time"] or it["time"].timestamp() >= cutoff]
 
-    # 3) 신규만 남기기
+    # 3) 신규만
     fresh: List[Dict[str, Any]] = []
     for it in items:
         key = hashlib.sha1(f"{it['title']}{it['link']}".encode("utf-8", "ignore")).hexdigest()
@@ -312,7 +277,7 @@ def main():
         sent[key] = time.time()
         fresh.append(it)
 
-    # 4) 최신순 정렬
+    # 4) 최신순
     fresh.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
 
     # 5) 국가별 상한
