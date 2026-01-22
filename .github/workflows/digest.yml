@@ -6,9 +6,14 @@ on:
     - cron: "*/45 * * * *"
   workflow_dispatch:
 
+concurrency:
+  group: rss-digest-mailer
+  cancel-in-progress: true
+
 jobs:
   send-digest:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -19,12 +24,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (RSS only)
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements_rss.txt
 
-      # 🔥 여기서 Gmail 시크릿을 명시적으로 주입 (핵심)
       - name: Run digest
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
@@ -33,4 +37,3 @@ jobs:
           SUBJECT_PREFIX: "[RSS]"
         run: |
           python rss_digest.py
-
