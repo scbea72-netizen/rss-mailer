@@ -1,21 +1,23 @@
-name: News Digest -> Hanmail
+name: RSS Digest Mailer (Manual Only)
 
 on:
-  schedule:
-    - cron: "*/45 * * * *"
   workflow_dispatch:
 
 concurrency:
-  group: news-digest-hanmail
+  group: rss-digest-mailer
   cancel-in-progress: true
 
 jobs:
   send-digest:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 10
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -24,9 +26,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run rss digest
+      - name: Restore cache (dedupe + title translate)
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/rss
+          key: rss-digest-cache
+          restore-keys: |
+            rss-digest-cache
+
+      - name: Run digest
         env:
-          # ✅ 한메일 전용 (지메일로 튀는 사고 방지)
+          # ✅ 이 워크플로는 “수동 테스트용”으로만 유지 (자동발송은 News Digest -> Hanmail이 담당)
           SMTP_HOST: "smtp.daum.net"
           SMTP_PORT: "465"
           SMTP_USER: ${{ secrets.HANMAIL_USER }}
@@ -35,6 +46,7 @@ jobs:
           MAIL_FROM: ${{ secrets.HANMAIL_FROM }}
 
           REQUEST_TIMEOUT: "15"
+          BATCH_WINDOW_SECONDS: "0"
           MAX_AGE_HOURS: "48"
           MAX_ITEMS_PER_FEED: "50"
 
@@ -46,6 +58,7 @@ jobs:
           TITLE_TRANSLATE: "1"
           TITLE_TRANSLATE_PROVIDER: "mymemory"
           TRANSLATE_SLEEP_SECONDS: "1.0"
+
           JP_KEYWORD_MODE: "0"
           RESOLVE_FINAL_URL: "0"
         run: |
