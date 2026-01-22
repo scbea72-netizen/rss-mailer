@@ -29,8 +29,18 @@ TG_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TG_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 TOPN = int(os.getenv("TOPN", "30"))
-VOL_MULT = float(os.getenv("VOL_MULT", "1.0"))
-NEAR_PCT = float(os.getenv("NEAR_PCT", "0.005"))
+
+# ✅ 현실형 기본값
+VOL_MULT = float(os.getenv("VOL_MULT", "0.7"))          # 평균 거래량의 70%만 넘어도 통과
+NEAR_PCT = float(os.getenv("NEAR_PCT", "0.012"))        # ±1.2%
+
+# ✅ 최근 며칠 내 돌파도 포함
+BREAKOUT_LOOKBACK = int(os.getenv("BREAKOUT_LOOKBACK", "3"))
+
+# ✅ 유지(상방 유지) 트랙
+ABOVE_MIN_PCT = float(os.getenv("ABOVE_MIN_PCT", "0.003"))  # +0.3% 이상
+ABOVE_MAX_PCT = float(os.getenv("ABOVE_MAX_PCT", "0.05"))   # +5% 이내
+ABOVE_VOL_MULT = float(os.getenv("ABOVE_VOL_MULT", "0.6"))  # 평균의 60%만 넘어도
 
 TEST_LIMIT = int(os.getenv("TEST_LIMIT", "400"))
 FULL_SCAN = os.getenv("FULL_SCAN", "0").strip() == "1"
@@ -55,9 +65,6 @@ def parse_recipients(raw: str):
 
 
 def must_env():
-    """
-    메일 전송은 필수, 텔레그램은 옵션(있으면 보내고, 없거나 실패해도 Job은 성공 처리)
-    """
     miss = []
     if not KIS_APPKEY: miss.append("KIS_APPKEY")
     if not KIS_APPSECRET: miss.append("KIS_APPSECRET")
@@ -72,7 +79,7 @@ def must_env():
 
 def request_with_retry(method, url, *, headers=None, params=None, data=None, json=None, timeout=REQ_TIMEOUT):
     last_err = None
-    for attempt in range(1, MAX_RETRY + 2):
+    for _ in range(1, MAX_RETRY + 2):
         try:
             r = session.request(method, url, headers=headers, params=params, data=data, json=json, timeout=timeout)
             r.raise_for_status()
@@ -84,10 +91,9 @@ def request_with_retry(method, url, *, headers=None, params=None, data=None, jso
 
 
 # -----------------------------
-# Telegram helpers (핵심 수정)
+# Telegram helpers
 # -----------------------------
 def tg_debug_env():
-    # 값 자체는 마스킹/보안 때문에 출력 금지, 길이만 출력
     print(f"[TG] token_len={len(TG_TOKEN)} chat_id_len={len(TG_CHAT_ID)}", flush=True)
 
 
@@ -96,51 +102,30 @@ def tg_api_base():
 
 
 def tg_check_token():
-    """
-    토큰이 유효한지 getMe로 미리 확인.
-    여기서 401이면 토큰이 틀렸거나(구토큰/오타/공백), 시크릿 주입이 잘못된 것.
-    """
     if not TG_TOKEN:
         return False, "token missing"
     try:
         r = request_with_retry("GET", f"{tg_api_base()}/getMe", timeout=15)
         j = r.json()
-        ok = bool(j.get("ok"))
-        if ok:
+        if j.get("ok"):
             return True, "ok"
         return False, f"getMe not ok: {str(j)[:200]}"
-    except requests.exceptions.HTTPError as e:
-        # 401 Unauthorized가 여기서 걸리면 토큰 문제 확정
-        resp = getattr(e, "response", None)
-        body = ""
-        try:
-            if resp is not None:
-                body = (resp.text or "")[:300]
-        except Exception:
-            body = ""
-        return False, f"HTTPError {getattr(resp, 'status_code', '?')} {body}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
 
 def tg_send(text: str):
-    """
-    텔레그램 전송 실패해도 raise 하지 않음(메일은 이미 갔는데 텔레그램 때문에 Job이 FAIL 나는걸 방지)
-    """
     if not (TG_TOKEN and TG_CHAT_ID):
         print("[TG] token/chat_id missing -> skip", flush=True)
         return False
 
-    # 토큰 사전 체크
     ok, msg = tg_check_token()
     if not ok:
         print(f"[TG] token invalid -> skip. reason={msg}", flush=True)
-        print("[TG] Fix: BotFather에서 /revoke 후 새 토큰 발급 -> GitHub Secret TELEGRAM_BOT_TOKEN 값 교체", flush=True)
         return False
 
     url = f"{tg_api_base()}/sendMessage"
 
-    # Telegram 메시지 길이 제한 대비 분할
     chunks = []
     s = text or ""
     while len(s) > 3900:
@@ -151,24 +136,10 @@ def tg_send(text: str):
     sent = 0
     for c in chunks:
         try:
-            r = request_with_retry(
-                "POST",
-                url,
-                data={"chat_id": TG_CHAT_ID, "text": c},
-                timeout=15
-            )
-            _ = r.json()
+            request_with_retry("POST", url, data={"chat_id": TG_CHAT_ID, "text": c}, timeout=15)
             sent += 1
         except Exception as e:
-            # 여기서 raise 금지
             print(f"[TG] send failed chunk={sent+1}/{len(chunks)} err={type(e).__name__}: {e}", flush=True)
-            # 가능한 경우 응답 본문 일부 출력
-            resp = getattr(e, "response", None)
-            try:
-                if resp is not None and getattr(resp, "text", None):
-                    print(f"[TG] response_body={resp.text[:300]}", flush=True)
-            except Exception:
-                pass
             return False
 
     print(f"[TG] sent ok chunks={sent}", flush=True)
@@ -208,12 +179,22 @@ def load_mst(zip_bytes):
     return m
 
 
-def get_universe():
+def get_universe_with_market():
+    """
+    ✅ 코스피/코스닥 구분용: code -> market 맵 구성
+    """
     kospi = load_mst(download_mst(KOSPI_URL))
     kosdaq = load_mst(download_mst(KOSDAQ_URL))
+
     name_map = {**kospi, **kosdaq}
+    market_map = {}
+    for c in kospi.keys():
+        market_map[c] = "KOSPI"
+    for c in kosdaq.keys():
+        market_map[c] = "KOSDAQ"
+
     codes = sorted(name_map.keys())
-    return codes, name_map
+    return codes, name_map, market_map
 
 
 def daily_chart(token, code):
@@ -278,61 +259,125 @@ def parse_df(j):
     if not rows:
         return None
     df = pd.DataFrame(rows).sort_values("date")
-    return df if len(df) >= 25 else None
+    return df if len(df) >= 30 else None
 
 
 def signal(df):
-    if df is None or len(df) < 25:
+    if df is None or len(df) < 30:
         return None
 
-    c = df["close"]
-    v = df["volume"]
+    c = df["close"].astype(float)
+    v = df["volume"].astype(float)
     ma20 = c.rolling(20).mean()
     vma20 = v.rolling(20).mean()
 
     if pd.isna(ma20.iloc[-1]) or pd.isna(vma20.iloc[-1]) or vma20.iloc[-1] == 0:
         return None
 
-    c0, c1 = c.iloc[-1], c.iloc[-2]
-    m0, m1 = ma20.iloc[-1], ma20.iloc[-2]
+    c0 = float(c.iloc[-1])
+    m0 = float(ma20.iloc[-1])
+    pct = (c0 / m0 - 1.0) * 100.0
+    volx = float(v.iloc[-1] / vma20.iloc[-1])
 
-    volx = v.iloc[-1] / vma20.iloc[-1]
+    # 거래량(현실형) 필터
     if volx < VOL_MULT:
         return None
 
-    breakout = (c1 < m1) and (c0 >= m0)
-    near = abs(c0 / m0 - 1) <= NEAR_PCT
-    if not (breakout or near):
+    # 근접
+    near = abs(c0 / m0 - 1.0) <= NEAR_PCT
+
+    # 돌파(최근 lookback일)
+    lb = max(1, int(BREAKOUT_LOOKBACK))
+    breakout = False
+    start = max(1, len(df) - lb - 1)
+    for i in range(start, len(df) - 1):
+        if pd.isna(ma20.iloc[i]) or pd.isna(ma20.iloc[i + 1]):
+            continue
+        if c.iloc[i] < ma20.iloc[i] and c.iloc[i + 1] >= ma20.iloc[i + 1]:
+            breakout = True
+            break
+
+    # 유지(상방 유지)
+    above = False
+    if c0 >= m0:
+        dist = (c0 / m0 - 1.0)
+        if (dist >= ABOVE_MIN_PCT) and (dist <= ABOVE_MAX_PCT) and (volx >= ABOVE_VOL_MULT):
+            above = True
+
+    if not (breakout or near or above):
         return None
 
     return {
-        "close": float(c0),
-        "ma20": float(m0),
-        "pct": float((c0 / m0 - 1) * 100),
+        "close": c0,
+        "ma20": m0,
+        "pct": float(pct),
         "volx": float(volx),
         "date": df["date"].iloc[-1].strftime("%Y-%m-%d"),
         "breakout": breakout,
-        "near": near
+        "near": near,
+        "above": above,
     }
 
 
-def send_mail(hits_b, hits_n):
+def split_by_market(items):
+    kospi = [x for x in items if x.get("market") == "KOSPI"]
+    kosdaq = [x for x in items if x.get("market") == "KOSDAQ"]
+    return kospi, kosdaq
+
+
+def sort_and_dedupe(hits_b, hits_n, hits_a):
+    # 우선순위: 돌파 > 근접 > 유지
+    hits_b.sort(key=lambda x: x["pct"], reverse=True)
+    bset = {h["code"] for h in hits_b}
+
+    hits_n = [x for x in hits_n if x["code"] not in bset]
+    hits_n.sort(key=lambda x: abs(x["pct"]))
+    bnset = bset | {h["code"] for h in hits_n}
+
+    hits_a = [x for x in hits_a if x["code"] not in bnset]
+    hits_a.sort(key=lambda x: x["pct"], reverse=True)
+
+    return hits_b[:TOPN], hits_n[:TOPN], hits_a[:TOPN]
+
+
+def fmt_rows(items):
+    return "\n".join(
+        f"[{x['type']}] {x['code']} {x['name']} | {x['industry']} | {x['pct']:+.2f}% | {x['volx']:.2f}x"
+        for x in items
+    )
+
+
+def send_mail(kospi_b, kospi_n, kospi_a, kosdaq_b, kosdaq_n, kosdaq_a):
     to_list = parse_recipients(MAIL_TO_RAW)
     if not to_list:
         raise RuntimeError("HANMAIL_TO invalid")
 
-    def fmt_rows(items):
-        return "\n".join(
-            f"[{x['type']}] {x['code']} {x['name']} | {x['industry']} | {x['pct']:+.2f}% | {x['volx']:.2f}x"
-            for x in items
-        )
+    subject = (
+        f"[KIS] "
+        f"KOSPI 돌파{len(kospi_b)}/근접{len(kospi_n)}/유지{len(kospi_a)} | "
+        f"KOSDAQ 돌파{len(kosdaq_b)}/근접{len(kosdaq_n)}/유지{len(kosdaq_a)}"
+    )
 
-    subject = f"[KIS] 20일선 돌파 {len(hits_b)} / 근접 {len(hits_n)}"
-    body = f"""[📈 돌파]
-{fmt_rows(hits_b) or '없음'}
+    body = f"""[KOSPI 📌]
+[📈 돌파(최근 {BREAKOUT_LOOKBACK}일)]
+{fmt_rows(kospi_b) or '없음'}
 
-[👀 근접]
-{fmt_rows(hits_n) or '없음'}
+[👀 근접(±{NEAR_PCT*100:.1f}%)]
+{fmt_rows(kospi_n) or '없음'}
+
+[✅ 유지(상방 유지)]
+{fmt_rows(kospi_a) or '없음'}
+
+
+[KOSDAQ 📌]
+[📈 돌파(최근 {BREAKOUT_LOOKBACK}일)]
+{fmt_rows(kosdaq_b) or '없음'}
+
+[👀 근접(±{NEAR_PCT*100:.1f}%)]
+{fmt_rows(kosdaq_n) or '없음'}
+
+[✅ 유지(상방 유지)]
+{fmt_rows(kosdaq_a) or '없음'}
 """
 
     msg = MIMEText(body, "plain", "utf-8")
@@ -350,15 +395,13 @@ def send_mail(hits_b, hits_n):
 
 def main():
     must_env()
-
-    # 텔레그램 환경값 길이 로그(401 원인 즉시 파악)
     tg_debug_env()
 
     print("[START] get token", flush=True)
     token = kis_token()
 
     print("[START] load universe", flush=True)
-    codes, name_map = get_universe()
+    codes, name_map, market_map = get_universe_with_market()
 
     if not FULL_SCAN:
         codes = codes[:TEST_LIMIT]
@@ -366,7 +409,7 @@ def main():
     else:
         print(f"[MODE] FULL_SCAN=1 (TOTAL={len(codes)})", flush=True)
 
-    hits_b, hits_n = [], []
+    hits_b, hits_n, hits_a = [], [], []
     industry_cache = {}
 
     total = len(codes)
@@ -392,6 +435,7 @@ def main():
 
             nm = name_map.get(code, "")
             base = {
+                "market": market_map.get(code, "UNKNOWN"),
                 "code": code,
                 "name": nm,
                 "industry": industry_cache[code],
@@ -403,6 +447,8 @@ def main():
                 hits_b.append(base)
             if sig["near"]:
                 hits_n.append(base)
+            if sig["above"]:
+                hits_a.append(base)
 
         except Exception as e:
             print(f"[SKIP] {code} err={type(e).__name__}", flush=True)
@@ -410,21 +456,26 @@ def main():
         if i % SLEEP_EVERY == 0:
             time.sleep(SLEEP_SEC)
 
-    hits_b.sort(key=lambda x: x["pct"], reverse=True)
-    bset = {h["code"] for h in hits_b}
-    hits_n = [x for x in hits_n if x["code"] not in bset]
-    hits_n.sort(key=lambda x: abs(x["pct"]))
+    # 전체에서 먼저 정리
+    hits_b, hits_n, hits_a = sort_and_dedupe(hits_b, hits_n, hits_a)
 
-    hits_b = hits_b[:TOPN]
-    hits_n = hits_n[:TOPN]
+    # 시장별로 분리 후 각 시장 내에서 다시 TOPN 보장
+    kospi_b, kosdaq_b = split_by_market(hits_b)
+    kospi_n, kosdaq_n = split_by_market(hits_n)
+    kospi_a, kosdaq_a = split_by_market(hits_a)
 
-    print(f"[RESULT] breakout={len(hits_b)} near={len(hits_n)}", flush=True)
+    kospi_b = kospi_b[:TOPN]; kospi_n = kospi_n[:TOPN]; kospi_a = kospi_a[:TOPN]
+    kosdaq_b = kosdaq_b[:TOPN]; kosdaq_n = kosdaq_n[:TOPN]; kosdaq_a = kosdaq_a[:TOPN]
 
-    subject, body = send_mail(hits_b, hits_n)
+    print(
+        f"[RESULT] "
+        f"KOSPI(b={len(kospi_b)}, n={len(kospi_n)}, a={len(kospi_a)}) "
+        f"KOSDAQ(b={len(kosdaq_b)}, n={len(kosdaq_n)}, a={len(kosdaq_a)})",
+        flush=True
+    )
 
-    # 텔레그램도 같이 (실패해도 프로그램은 성공 처리)
+    subject, body = send_mail(kospi_b, kospi_n, kospi_a, kosdaq_b, kosdaq_n, kosdaq_a)
     _ = tg_send(subject + "\n" + body)
-
     print("[OK] done", flush=True)
 
 
