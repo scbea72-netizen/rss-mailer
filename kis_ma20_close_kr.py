@@ -48,11 +48,16 @@ TR_ID_PRICE = "FHKST01010100"
 
 session = requests.Session()
 
+
 def parse_recipients(raw: str):
     raw = (raw or "").strip().replace(";", ",")
     return [x.strip() for x in raw.split(",") if x.strip()]
 
+
 def must_env():
+    """
+    메일 전송은 필수, 텔레그램은 옵션(있으면 보내고, 없거나 실패해도 Job은 성공 처리)
+    """
     miss = []
     if not KIS_APPKEY: miss.append("KIS_APPKEY")
     if not KIS_APPSECRET: miss.append("KIS_APPSECRET")
@@ -64,11 +69,12 @@ def must_env():
     if miss:
         raise RuntimeError("Missing ENV: " + ", ".join(miss))
 
-def request_with_retry(method, url, *, headers=None, params=None, json=None, timeout=REQ_TIMEOUT):
+
+def request_with_retry(method, url, *, headers=None, params=None, data=None, json=None, timeout=REQ_TIMEOUT):
     last_err = None
     for attempt in range(1, MAX_RETRY + 2):
         try:
-            r = session.request(method, url, headers=headers, params=params, json=json, timeout=timeout)
+            r = session.request(method, url, headers=headers, params=params, data=data, json=json, timeout=timeout)
             r.raise_for_status()
             return r
         except Exception as e:
@@ -76,22 +82,102 @@ def request_with_retry(method, url, *, headers=None, params=None, json=None, tim
             time.sleep(RETRY_SLEEP)
     raise last_err
 
+
+# -----------------------------
+# Telegram helpers (핵심 수정)
+# -----------------------------
+def tg_debug_env():
+    # 값 자체는 마스킹/보안 때문에 출력 금지, 길이만 출력
+    print(f"[TG] token_len={len(TG_TOKEN)} chat_id_len={len(TG_CHAT_ID)}", flush=True)
+
+
+def tg_api_base():
+    return f"https://api.telegram.org/bot{TG_TOKEN}"
+
+
+def tg_check_token():
+    """
+    토큰이 유효한지 getMe로 미리 확인.
+    여기서 401이면 토큰이 틀렸거나(구토큰/오타/공백), 시크릿 주입이 잘못된 것.
+    """
+    if not TG_TOKEN:
+        return False, "token missing"
+    try:
+        r = request_with_retry("GET", f"{tg_api_base()}/getMe", timeout=15)
+        j = r.json()
+        ok = bool(j.get("ok"))
+        if ok:
+            return True, "ok"
+        return False, f"getMe not ok: {str(j)[:200]}"
+    except requests.exceptions.HTTPError as e:
+        # 401 Unauthorized가 여기서 걸리면 토큰 문제 확정
+        resp = getattr(e, "response", None)
+        body = ""
+        try:
+            if resp is not None:
+                body = (resp.text or "")[:300]
+        except Exception:
+            body = ""
+        return False, f"HTTPError {getattr(resp, 'status_code', '?')} {body}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 def tg_send(text: str):
+    """
+    텔레그램 전송 실패해도 raise 하지 않음(메일은 이미 갔는데 텔레그램 때문에 Job이 FAIL 나는걸 방지)
+    """
     if not (TG_TOKEN and TG_CHAT_ID):
         print("[TG] token/chat_id missing -> skip", flush=True)
-        return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        return False
+
+    # 토큰 사전 체크
+    ok, msg = tg_check_token()
+    if not ok:
+        print(f"[TG] token invalid -> skip. reason={msg}", flush=True)
+        print("[TG] Fix: BotFather에서 /revoke 후 새 토큰 발급 -> GitHub Secret TELEGRAM_BOT_TOKEN 값 교체", flush=True)
+        return False
+
+    url = f"{tg_api_base()}/sendMessage"
+
+    # Telegram 메시지 길이 제한 대비 분할
     chunks = []
-    s = text
+    s = text or ""
     while len(s) > 3900:
         chunks.append(s[:3900])
         s = s[3900:]
     chunks.append(s)
 
+    sent = 0
     for c in chunks:
-        r = requests.post(url, data={"chat_id": TG_CHAT_ID, "text": c}, timeout=15)
-        r.raise_for_status()
+        try:
+            r = request_with_retry(
+                "POST",
+                url,
+                data={"chat_id": TG_CHAT_ID, "text": c},
+                timeout=15
+            )
+            _ = r.json()
+            sent += 1
+        except Exception as e:
+            # 여기서 raise 금지
+            print(f"[TG] send failed chunk={sent+1}/{len(chunks)} err={type(e).__name__}: {e}", flush=True)
+            # 가능한 경우 응답 본문 일부 출력
+            resp = getattr(e, "response", None)
+            try:
+                if resp is not None and getattr(resp, "text", None):
+                    print(f"[TG] response_body={resp.text[:300]}", flush=True)
+            except Exception:
+                pass
+            return False
 
+    print(f"[TG] sent ok chunks={sent}", flush=True)
+    return True
+
+
+# -----------------------------
+# KIS helpers
+# -----------------------------
 def kis_token():
     r = request_with_retry(
         "POST",
@@ -101,9 +187,11 @@ def kis_token():
     )
     return r.json()["access_token"]
 
+
 def download_mst(url):
     r = request_with_retry("GET", url, timeout=MST_TIMEOUT)
     return r.content
+
 
 def load_mst(zip_bytes):
     zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -119,12 +207,14 @@ def load_mst(zip_bytes):
             m[code] = line[6:40].strip()
     return m
 
+
 def get_universe():
     kospi = load_mst(download_mst(KOSPI_URL))
     kosdaq = load_mst(download_mst(KOSDAQ_URL))
     name_map = {**kospi, **kosdaq}
     codes = sorted(name_map.keys())
     return codes, name_map
+
 
 def daily_chart(token, code):
     r = request_with_retry(
@@ -146,6 +236,7 @@ def daily_chart(token, code):
     )
     return r.json()
 
+
 def industry_name(token, code):
     r = request_with_retry(
         "GET",
@@ -164,12 +255,14 @@ def industry_name(token, code):
     )
     return (r.json().get("output", {}).get("bstp_kor_isnm") or "기타").strip()
 
+
 def is_etf(name: str) -> bool:
     if not name:
         return False
-    etf_keywords = ["KODEX","TIGER","KBSTAR","ARIRANG","HANARO","KOSEF","ACE","SOL","TIMEFOLIO"]
+    etf_keywords = ["KODEX", "TIGER", "KBSTAR", "ARIRANG", "HANARO", "KOSEF", "ACE", "SOL", "TIMEFOLIO"]
     up = name.upper()
     return any(k in up for k in etf_keywords)
+
 
 def parse_df(j):
     rows = []
@@ -186,6 +279,7 @@ def parse_df(j):
         return None
     df = pd.DataFrame(rows).sort_values("date")
     return df if len(df) >= 25 else None
+
 
 def signal(df):
     if df is None or len(df) < 25:
@@ -221,6 +315,7 @@ def signal(df):
         "near": near
     }
 
+
 def send_mail(hits_b, hits_n):
     to_list = parse_recipients(MAIL_TO_RAW)
     if not to_list:
@@ -252,8 +347,12 @@ def send_mail(hits_b, hits_n):
     print(f"[MAIL] sent ok -> {to_list}", flush=True)
     return subject, body
 
+
 def main():
     must_env()
+
+    # 텔레그램 환경값 길이 로그(401 원인 즉시 파악)
+    tg_debug_env()
 
     print("[START] get token", flush=True)
     token = kis_token()
@@ -321,14 +420,13 @@ def main():
 
     print(f"[RESULT] breakout={len(hits_b)} near={len(hits_n)}", flush=True)
 
-    out = send_mail(hits_b, hits_n)
+    subject, body = send_mail(hits_b, hits_n)
 
-    # 텔레그램도 같이
-    if out:
-        subject, body = out
-        tg_send(subject + "\n" + body)
+    # 텔레그램도 같이 (실패해도 프로그램은 성공 처리)
+    _ = tg_send(subject + "\n" + body)
 
     print("[OK] done", flush=True)
+
 
 if __name__ == "__main__":
     main()
