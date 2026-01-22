@@ -1,22 +1,20 @@
-name: KRX MA20 Close Scan (Mail + Telegram)
+name: KRX MA20 Close Scan (Mail + Telegram) - KIS
 
 on:
   schedule:
-    # KST 기준 장마감 이후 18:10 (UTC 09:10)
+    # KST 18:10 = UTC 09:10
     - cron: "10 9 * * 1-5"
   workflow_dispatch:
 
 env:
   TZ: Asia/Seoul
 
-  # ===== 스캔 파라미터 =====
-  TOP_N: "50"                 # 결과 상위 N개
-  VALUE_FLOOR: "5000000000"   # 거래대금 하한 (50억)
-  NEAR_PCT: "0.01"            # MA20 근접 범위 ±1%
-
-  # ===== 거래일 전략 =====
-  TRADING_DAYS: "25"          # 실제 분석에 사용할 거래일
-  FETCH_DAYS: "45"            # 수집 시도 거래일 (여유분)
+  # ===== Scan Params =====
+  TOP_N: "50"
+  VALUE_FLOOR: "5000000000"   # 50억
+  NEAR_PCT: "0.01"
+  TRADING_DAYS: "25"
+  FETCH_DAYS: "30"
 
 jobs:
   scan-and-notify:
@@ -34,13 +32,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # ❗ exchange-calendars 완전 제거 (timezone 에러 원인)
-          pip install -U pykrx pandas pytz
+          pip install pandas requests pytz
 
-      - name: Run KRX MA20 scan (Mail + Telegram)
+      - name: Run KIS MA20 scan (Mail + Telegram)
         env:
-          # ===== Mail (SMTP) =====
+          # ===== SMTP =====
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -52,9 +48,15 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
 
+          # ===== KIS OpenAPI (핵심) =====
+          KIS_APPKEY:        ${{ secrets.KIS_APPKEY }}
+          KIS_APPSECRET:     ${{ secrets.KIS_APPSECRET }}
+          KIS_BASE_URL:      ${{ secrets.KIS_BASE_URL }}
+          KIS_KOSPI_MST_URL: ${{ secrets.KIS_KOSPI_MST_URL }}
+          KIS_KOSDAQ_MST_URL:${{ secrets.KIS_KOSDAQ_MST_URL }}
+
         run: |
           python scripts/ma20_scan_kr.py
 
       - name: Job completed
-        run: echo "KRX MA20 scan finished successfully"
-
+        run: echo "KIS MA20 scan finished"
