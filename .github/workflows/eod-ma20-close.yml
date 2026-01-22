@@ -1,14 +1,18 @@
-name: EOD MA20 Close (US/JP)
+name: KRX MA20 Close 15:40 (KR)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "40 6 * * 1-5"  # 평일 15:40 KST (UTC 06:40)
+    - cron: "40 6 * * 1-5" # 평일 15:40 KST (UTC 06:40)
+
+concurrency:
+  group: krx-ma20-close
+  cancel-in-progress: true
 
 jobs:
-  scan:
+  scan-and-notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -22,41 +26,41 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests
+          pip install -r requirements.txt
 
       - name: Check required env
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO:    ${{ secrets.MAIL_TO }}
         run: |
           python - << 'PY'
           import os
-          keys = ["EOD_API_KEY","GMAIL_USER","GMAIL_APP_PASS","HANMAIL_TO","TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"]
+          keys = ["TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","SMTP_USER","SMTP_PASS","MAIL_TO"]
           for k in keys:
-            v = os.getenv(k, "")
-            print(f"{k}={'OK' if v else 'MISSING'}")
+              v = os.getenv(k, "")
+              print(f"{k}={'OK' if v else 'MISSING'}")
           PY
+
+      - name: Run KRX MA20 scan (Mail + Telegram)
         env:
-          EOD_API_KEY: ${{ secrets.EOD_API_KEY }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
-          HANMAIL_TO: ${{ secrets.HANMAIL_TO }}
+          # 출력 옵션
+          TOP_N: "50"
+          VALUE_FLOOR: "5000000000"   # 50억
+          NEAR_PCT: "0.01"            # 1%
+
+          # Telegram
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      - name: Run EOD scan (Mail + Telegram)
-        timeout-minutes: 15
-        env:
-          EOD_API_KEY: ${{ secrets.EOD_API_KEY }}
-
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
-          HANMAIL_TO: ${{ secrets.HANMAIL_TO }}
-
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          SMTP_HOST: smtp.gmail.com
-          SMTP_PORT: "465"
-
-          TOPN: "30"
-          NEAR_PCT: "0.005"
+          # Email (Gmail SMTP)
+          SMTP_HOST: "smtp.gmail.com"
+          SMTP_PORT: "587"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO:    ${{ secrets.MAIL_TO }}
         run: |
-          python eod_ma20_close.py
+          python scripts/ma20_scan_kr.py
