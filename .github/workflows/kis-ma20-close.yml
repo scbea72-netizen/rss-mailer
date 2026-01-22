@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: "30 6 * * 1-5"  # 평일 15:30 KST (UTC 06:30)
 
+concurrency:
+  group: kis-ma20-close
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -19,10 +23,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install deps (KIS only)
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests
+          pip install -r requirements_kis.txt
 
       - name: Check required env
         run: |
