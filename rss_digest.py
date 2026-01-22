@@ -2,46 +2,44 @@
 # -*- coding: utf-8 -*-
 
 """
-rss_digest.py (뉴스 메일러)
+rss_digest.py (RSS 뉴스 메일러 – 최종 안정판)
 
-요구사항:
-- KR(한국): 제목 그대로
-- US/JP(미국/일본): 제목만 "진짜" 한글 번역 (무료 MyMemory)
-- 본문은 원문(링크만)
-- 번역 실패/제한 시: 원문 제목 그대로(메일 발송은 계속)
-- 캐시로 번역 호출 최소화
-- 45분 주기(워크플로에서 설정)에도 안정적으로 동작
-
-주의:
-- MyMemory는 무료라서 순간 호출이 많으면 번역이 원문으로 돌아올 수 있음(일시적).
-  그래도 캐시가 쌓이면 다음부터는 대부분 한글로 안정됨.
+정책
+- KR: 제목 그대로
+- US / JP: 제목만 한글 번역 (MyMemory 무료)
+- 본문 번역 없음 (링크만)
+- 번역 실패해도 메일은 무조건 발송
 """
 
 from __future__ import annotations
 
-import os
-import re
-import json
-import time
-import hashlib
-import traceback
+import os, re, json, time, hashlib, traceback
 from datetime import datetime, timezone
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import smtplib
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, urlunparse
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import smtplib
 
 import requests
 import feedparser
 from dateutil import parser as dtparser
 
-
-# -----------------------------
-# 0) Runtime knobs (ENV)
-# -----------------------------
+# =====================
+# 0. ENV
+# =====================
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
+MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "30"))
+MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "48"))
+
+MAX_US = int(os.getenv("MAX_US", "25"))
+MAX_KR = int(os.getenv("MAX_KR", "25"))
+MAX_JP = int(os.getenv("MAX_JP", "25"))
+MAX_ITEMS_PER_EMAIL = int(os.getenv("MAX_ITEMS_PER_EMAIL", "120"))
+
+TITLE_TRANSLATE = os.getenv("TITLE_TRANSLATE", "1") == "1"
+TRANSLATE_SLEEP_SECONDS = float(os.getenv("TRANSLATE_SLEEP_SECONDS", "1.0"))
 
 USER_AGENT = os.getenv(
     "USER_AGENT",
@@ -49,481 +47,206 @@ USER_AGENT = os.getenv(
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "30"))
-MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "48"))
-
-# 기존 90초 필터로 기사 1~2개만 오는 문제 방지 (기본 OFF)
-BATCH_WINDOW_SECONDS = int(os.getenv("BATCH_WINDOW_SECONDS", "0"))
-
-# 한 통 최대 개수
-MAX_ITEMS_PER_EMAIL = int(os.getenv("MAX_ITEMS_PER_EMAIL", "120"))
-
-# 국가별 상한
-MAX_US = int(os.getenv("MAX_US", "25"))
-MAX_KR = int(os.getenv("MAX_KR", "25"))
-MAX_JP = int(os.getenv("MAX_JP", "25"))
-
-# JP 키워드 필터 (원하면 OFF)
-JP_KEYWORD_MODE = os.getenv("JP_KEYWORD_MODE", "0").strip().lower() in ("1", "true", "yes")
-JP_KEYWORDS = [k.strip() for k in os.getenv(
-    "JP_KEYWORDS",
-    "boj,bank of japan,yen,jpy,nikkei,tokyo stock,topix,fx,usd/jpy,semiconductor,hbm,chip,ai,robot,sony,toyota,softbank,tsmc,renesas,advantest,screen holdings,disco"
-).split(",") if k.strip()]
-
-JP_EXCLUDE_KEYWORDS = [k.strip() for k in os.getenv(
-    "JP_EXCLUDE_KEYWORDS",
-    "sports,baseball,soccer,entertainment,celebrity,crime"
-).split(",") if k.strip()]
-
-RESOLVE_FINAL_URL = os.getenv("RESOLVE_FINAL_URL", "0").strip().lower() in ("1", "true", "yes")
-
-# ✅ 제목 번역(진짜 번역) ON/OFF
-TITLE_TRANSLATE = os.getenv("TITLE_TRANSLATE", "1").strip().lower() in ("1", "true", "yes")
-TITLE_TRANSLATE_PROVIDER = os.getenv("TITLE_TRANSLATE_PROVIDER", "mymemory").strip().lower()
-
-# 번역 호출 속도 제한(무료 API 보호) - 기본 1초
-TRANSLATE_SLEEP_SECONDS = float(os.getenv("TRANSLATE_SLEEP_SECONDS", "1.0"))
-
-# -----------------------------
-# 1) HTTP Session
-# -----------------------------
+# =====================
+# 1. HTTP
+# =====================
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": USER_AGENT,
-    "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7,ja;q=0.6",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,ja;q=0.7",
 })
 
+# =====================
+# 2. FEEDS
+# =====================
+FEEDS = [
+    {"category": "US", "name": "Reuters Macro", "url": "https://www.reuters.com/rssFeed/macro"},
+    {"category": "US", "name": "Reuters World", "url": "https://www.reuters.com/world/rss"},
+    {"category": "US", "name": "CNBC Markets", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html"},
 
-# -----------------------------
-# 2) Feeds
-# -----------------------------
-FEEDS: List[Dict[str, str]] = [
-    # US / Global
-    {"category": "US", "name": "Reuters - Macro", "url": "https://www.reuters.com/rssFeed/macro"},
-    {"category": "US", "name": "Reuters - World", "url": "https://www.reuters.com/world/rss"},
-    {"category": "US", "name": "CNBC - Markets", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html"},
-    {"category": "US", "name": "CNBC - Economy", "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html"},
+    {"category": "KR", "name": "연합뉴스 시장", "url": "https://www.yna.co.kr/rss/market.xml"},
+    {"category": "KR", "name": "연합뉴스 경제", "url": "https://www.yna.co.kr/rss/economy.xml"},
 
-    # Korea
-    {"category": "KR", "name": "YNA - Market", "url": "https://www.yna.co.kr/rss/market.xml"},
-    {"category": "KR", "name": "YNA - Economy", "url": "https://www.yna.co.kr/rss/economy.xml"},
-
-    # Japan
-    {"category": "JP", "name": "NHK - Business", "url": "https://www3.nhk.or.jp/rss/news/cat5.xml"},
-    {"category": "JP", "name": "Reuters - Japan Business", "url": "https://feeds.reuters.com/reuters/JPbusinessNews"},
-    {"category": "JP", "name": "Nikkei - Top", "url": "https://www.nikkei.com/rss/news/cat0.xml"},
+    {"category": "JP", "name": "NHK Business", "url": "https://www3.nhk.or.jp/rss/news/cat5.xml"},
+    {"category": "JP", "name": "Reuters JP", "url": "https://feeds.reuters.com/reuters/JPbusinessNews"},
+    {"category": "JP", "name": "Nikkei", "url": "https://www.nikkei.com/rss/news/cat0.xml"},
 ]
 
-
-# -----------------------------
-# 3) SMTP / Mail
-# -----------------------------
+# =====================
+# 3. SMTP
+# =====================
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.daum.net")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
 MAIL_TO = os.getenv("MAIL_TO", SMTP_USER)
 MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
-
 SUBJECT_PREFIX = os.getenv("SUBJECT_PREFIX", "[RSS]")
 
-CACHE_PATH = Path(os.getenv("CACHE_PATH", ".cache/rss/sent_cache.json"))
-CACHE_MAX_KEYS = int(os.getenv("CACHE_MAX_KEYS", "5000"))
+# =====================
+# 4. CACHE
+# =====================
+CACHE_PATH = Path(".cache/rss/sent.json")
+TITLE_CACHE_PATH = Path(".cache/rss/title.json")
 
-# 번역 캐시(제목 -> 번역결과)
-TITLE_CACHE_PATH = Path(os.getenv("TITLE_CACHE_PATH", ".cache/rss/title_cache.json"))
-TITLE_CACHE_MAX = int(os.getenv("TITLE_CACHE_MAX", "5000"))
+def load_json(p: Path) -> Dict:
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except:
+            pass
+    return {}
 
+def save_json(p: Path, d: Dict):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
 
-# -----------------------------
-# 4) URL / Cache helpers
-# -----------------------------
-def canonicalize_url(url: str) -> str:
-    try:
-        u = urlparse(url)
-        qs = u.query
-        if qs:
-            kept = []
-            for part in qs.split("&"):
-                k = part.split("=", 1)[0].lower()
-                if k.startswith("utm_") or k in ("ref", "fbclid", "gclid", "igshid"):
-                    continue
-                kept.append(part)
-            qs = "&".join([p for p in kept if p])
-        u2 = u._replace(query=qs, fragment="")
-        return urlunparse(u2)
-    except Exception:
-        return url
+# =====================
+# 5. UTIL
+# =====================
+def canonical(url: str) -> str:
+    u = urlparse(url)
+    qs = "&".join(
+        p for p in u.query.split("&")
+        if not p.lower().startswith("utm_")
+    )
+    return urlunparse(u._replace(query=qs, fragment=""))
 
-def resolve_final_url(url: str) -> str:
-    if not RESOLVE_FINAL_URL:
-        return url
-    try:
-        r = SESSION.head(url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
-        if r.status_code >= 400 or not r.url:
-            r = SESSION.get(url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
-        return r.url or url
-    except Exception:
-        return url
-
-def parse_entry_time(entry: Dict[str, Any]) -> Optional[datetime]:
-    for key in ("published", "updated", "created"):
-        if entry.get(key):
+def parse_time(e) -> Optional[datetime]:
+    for k in ("published", "updated"):
+        if e.get(k):
             try:
-                dt = dtparser.parse(entry[key])
-                if not dt.tzinfo:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt
-            except Exception:
-                pass
-    for key in ("published_parsed", "updated_parsed"):
-        if entry.get(key):
-            try:
-                return datetime.fromtimestamp(time.mktime(entry[key]), tz=timezone.utc)
-            except Exception:
+                d = dtparser.parse(e[k])
+                return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+            except:
                 pass
     return None
 
-def load_cache() -> Dict[str, float]:
-    if CACHE_PATH.exists():
-        try:
-            data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return {k: float(v) for k, v in data.items()}
-        except Exception:
-            pass
-    return {}
+def has_ko(s: str) -> bool:
+    return any("가" <= c <= "힣" for c in s)
 
-def save_cache(cache: Dict[str, float]) -> None:
-    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if len(cache) > CACHE_MAX_KEYS:
-        items = sorted(cache.items(), key=lambda kv: kv[1])
-        cache = dict(items[-CACHE_MAX_KEYS:])
-    CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+def looks_ja(s: str) -> bool:
+    return any(0x3040 <= ord(c) <= 0x30ff for c in s)
 
-def load_title_cache() -> Dict[str, str]:
-    if TITLE_CACHE_PATH.exists():
-        try:
-            data = json.loads(TITLE_CACHE_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                return {str(k): str(v) for k, v in data.items()}
-        except Exception:
-            pass
-    return {}
-
-def save_title_cache(cache: Dict[str, str]) -> None:
-    TITLE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if len(cache) > TITLE_CACHE_MAX:
-        # 간단히 앞쪽 일부 제거(정교한 LRU 대신)
-        for k in list(cache.keys())[: len(cache) - TITLE_CACHE_MAX]:
-            cache.pop(k, None)
-    TITLE_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def make_key(category: str, feed_name: str, title: str, link: str) -> str:
-    raw = f"{category}|{feed_name}|{title}|{link}".encode("utf-8", errors="ignore")
-    return hashlib.sha256(raw).hexdigest()
-
-def filter_recent(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if MAX_AGE_HOURS <= 0:
-        return items
-    cutoff = datetime.now(timezone.utc).timestamp() - (MAX_AGE_HOURS * 3600)
-    return [it for it in items if not it.get("time") or it["time"].timestamp() >= cutoff]
-
-
-# -----------------------------
-# 5) Language detect / JP filter
-# -----------------------------
-def has_hangul(s: str) -> bool:
-    return any('가' <= ch <= '힣' for ch in s)
-
-def looks_japanese(s: str) -> bool:
-    # 히라가나/가타카나 + 일부 일본 특수 문자 범위
-    for ch in s:
-        o = ord(ch)
-        if (0x3040 <= o <= 0x30FF) or (0x31F0 <= o <= 0x31FF):
-            return True
-    return False
-
-def jp_keyword_pass(title: str) -> bool:
-    if not JP_KEYWORD_MODE:
-        return True
-    t = (title or "").lower()
-    if any(ex in t for ex in JP_EXCLUDE_KEYWORDS):
-        return False
-    return any(k.lower() in t for k in JP_KEYWORDS)
-
-
-# -----------------------------
-# 6) Real title translation (MyMemory)
-# -----------------------------
-_GLOSSARY = [
-    (re.compile(r"\bBOJ\b", re.I), "일본 중앙은행(BOJ)"),
-    (re.compile(r"\bBank of Japan\b", re.I), "일본 중앙은행(BOJ)"),
-    (re.compile(r"\bNikkei\b", re.I), "니케이"),
-    (re.compile(r"\bTOPIX\b", re.I), "TOPIX(도쿄 증시 지수)"),
-    (re.compile(r"\bUSD/JPY\b", re.I), "달러/엔(USD/JPY)"),
-    (re.compile(r"\bJPY\b", re.I), "엔화(JPY)"),
-    (re.compile(r"\byen\b", re.I), "엔화"),
-    (re.compile(r"\bFed\b", re.I), "미 연준(Fed)"),
-    (re.compile(r"\bECB\b", re.I), "유럽중앙은행(ECB)"),
-    (re.compile(r"\bCPI\b", re.I), "소비자물가(CPI)"),
-    (re.compile(r"\bPPI\b", re.I), "생산자물가(PPI)"),
-    (re.compile(r"\bGDP\b", re.I), "국내총생산(GDP)"),
-]
-
-def polish_terms_ko(text: str) -> str:
-    out = text
-    for pat, rep in _GLOSSARY:
-        out = pat.sub(rep, out)
-    out = re.sub(r"\s+", " ", out).strip()
-    return out
-
-def translate_title_mymemory(text: str, src: str, dest: str = "ko") -> str:
-    """
-    무료 MyMemory 번역.
-    제한/실패 시 원문 반환.
-    """
-    try:
-        params = {"q": text, "langpair": f"{src}|{dest}"}
-        r = SESSION.get(
-            "https://api.mymemory.translated.net/get",
-            params=params,
-            timeout=REQUEST_TIMEOUT
-        )
-        if r.status_code != 200:
-            return text
-        data = r.json()
-        out = (data.get("responseData", {}) or {}).get("translatedText")
-        if not out:
-            return text
-        out = str(out).strip()
-        if not out:
-            return text
-        return out
-    except Exception:
+# =====================
+# 6. TRANSLATE
+# =====================
+def translate_title(text: str, cache: Dict[str, str]) -> str:
+    if has_ko(text):
         return text
 
-def translate_title_if_needed(title: str, category: str, title_cache: Dict[str, str]) -> str:
-    """
-    KR: 그대로
-    US/JP: 제목만 한글 번역 (MyMemory) + 용어 후처리
-    번역 실패/제한: 원문 반환 (메일은 정상 발송)
-    """
-    t = (title or "").strip()
-    if not t:
-        return t
+    src = "ja" if looks_ja(text) else "en"
+    key = f"{src}|{text}"
+    if key in cache:
+        return cache[key]
 
-    if category == "KR":
-        return t
-
-    # 이미 한글이면 용어 다듬기만
-    if has_hangul(t):
-        return polish_terms_ko(t)
-
-    if not TITLE_TRANSLATE:
-        # 번역 OFF일 때도 가독성용 용어 치환만
-        return polish_terms_ko(t)
-
-    # 언어 추정: 일본어 문자 있으면 ja, 아니면 en
-    src = "ja" if looks_japanese(t) else "en"
-    ck = f"{src}|ko|{t}"
-    if ck in title_cache:
-        return title_cache[ck]
-
-    translated = t
-    if TITLE_TRANSLATE_PROVIDER == "mymemory":
-        translated = translate_title_mymemory(t, src, "ko")
-        # 무료 번역 품질/표기 보정
-        translated = polish_terms_ko(translated)
-    else:
-        # provider 확장 여지
-        translated = polish_terms_ko(t)
-
-    # 번역이 실패해서 원문이 그대로면, 그대로 캐시해도 OK(중복 호출 방지)
-    title_cache[ck] = translated
-
-    # 무료 API 보호: 요청 간격
-    if TRANSLATE_SLEEP_SECONDS > 0:
-        time.sleep(TRANSLATE_SLEEP_SECONDS)
-
-    return translated
-
-
-# -----------------------------
-# 7) Fetch feed items
-# -----------------------------
-def fetch_feed_items(feed: Dict[str, str]) -> List[Dict[str, Any]]:
     try:
-        content = SESSION.get(feed["url"], timeout=REQUEST_TIMEOUT).content
-        parsed = feedparser.parse(content)
+        r = SESSION.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": text, "langpair": f"{src}|ko"},
+            timeout=REQUEST_TIMEOUT
+        )
+        out = r.json().get("responseData", {}).get("translatedText", text)
+    except:
+        out = text
+
+    cache[key] = out
+    time.sleep(TRANSLATE_SLEEP_SECONDS)
+    return out
+
+# =====================
+# 7. FETCH
+# =====================
+def fetch(feed):
+    items = []
+    try:
+        parsed = feedparser.parse(
+            feed["url"],
+            request_headers={"User-Agent": USER_AGENT}
+        )
+        for e in parsed.entries[:MAX_ITEMS_PER_FEED]:
+            if not e.get("title") or not e.get("link"):
+                continue
+            items.append({
+                "category": feed["category"],
+                "feed": feed["name"],
+                "title": e.title.strip(),
+                "link": canonical(e.link.strip()),
+                "time": parse_time(e)
+            })
     except Exception:
-        parsed = feedparser.parse(feed["url"])
-
-    items: List[Dict[str, Any]] = []
-    for entry in parsed.entries[:MAX_ITEMS_PER_FEED]:
-        title = (entry.get("title") or "").strip()
-        link = (entry.get("link") or "").strip()
-        if not title or not link:
-            continue
-        if feed["category"] == "JP" and not jp_keyword_pass(title):
-            continue
-
-        items.append({
-            "category": feed["category"],
-            "feed": feed["name"],
-            "title": title,
-            "link": canonicalize_url(link),
-            "time": parse_entry_time(entry),
-        })
+        traceback.print_exc()
     return items
 
-
-# -----------------------------
-# 8) Email HTML
-# -----------------------------
-CATEGORY_SUBJECT = {"US": "미국/글로벌", "KR": "한국", "JP": "일본"}
-
-def escape_html(s: str) -> str:
-    return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-              .replace('"',"&quot;").replace("'","&#39;"))
-
-def build_email_html(items: List[Dict[str, Any]], title_cache: Dict[str, str]) -> str:
-    grouped: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    for it in items:
-        grouped.setdefault(it["category"], {}).setdefault(it["feed"], []).append(it)
-
-    now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
-    html: List[str] = [
-        f"<h2>{escape_html(SUBJECT_PREFIX)} {escape_html(now_local)}</h2>",
-        "<p style='color:#666'>※ 한국은 원문 / 미국·일본은 <b>제목만</b> 한글 번역(무료)으로 발송됩니다.</p>",
-        "<hr/>",
-    ]
-
-    for category in ["US", "KR", "JP"]:
-        feeds = grouped.get(category, {})
-        if not feeds:
+# =====================
+# 8. MAIL HTML
+# =====================
+def build_html(items, title_cache):
+    out = [f"<h2>{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}</h2><hr/>"]
+    for cat in ("US", "KR", "JP"):
+        group = [x for x in items if x["category"] == cat]
+        if not group:
             continue
-        html.append(f"<h2>[ {CATEGORY_SUBJECT.get(category, category)} ]</h2>")
-        for feed_name, feed_items in feeds.items():
-            html.append(f"<h3>{escape_html(feed_name)} ({len(feed_items)})</h3><ul>")
-            for it in feed_items:
-                shown_title = translate_title_if_needed(it["title"], it["category"], title_cache)
-                title = escape_html(shown_title)
+        out.append(f"<h3>[{cat}]</h3><ul>")
+        for it in group:
+            title = it["title"]
+            if cat != "KR" and TITLE_TRANSLATE:
+                title = translate_title(title, title_cache)
+            out.append(f"<li><a href='{it['link']}'>{title}</a></li>")
+        out.append("</ul>")
+    return "\n".join(out)
 
-                link = it["link"]
-                if RESOLVE_FINAL_URL:
-                    link = resolve_final_url(link)
-
-                t = it.get("time")
-                t_str = t.astimezone().strftime("%Y-%m-%d %H:%M") if t else ""
-                meta = f" <small style='color:#666'>({escape_html(t_str)})</small>" if t_str else ""
-                html.append(f"<li><a href='{escape_html(link)}'>{title}</a>{meta}</li>")
-            html.append("</ul><br/>")
-        html.append("<hr/>")
-
-    return "\n".join(html)
-
-
-# -----------------------------
-# 9) SMTP Send
-# -----------------------------
-def send_mail(subject: str, html_body: str) -> None:
-    if not SMTP_USER or not SMTP_PASS or not MAIL_TO:
-        raise RuntimeError("SMTP_USER/SMTP_PASS/MAIL_TO 환경변수 비어있음")
-
+# =====================
+# 9. SEND
+# =====================
+def send(subject, html):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = MAIL_FROM
     msg["To"] = MAIL_TO
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(MIMEText(html, "html", "utf-8"))
 
-    try:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
-            s.login(SMTP_USER, SMTP_PASS)
-            s.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
-            return
-    except Exception:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
-            s.ehlo(); s.starttls(); s.ehlo()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
+        s.login(SMTP_USER, SMTP_PASS)
+        s.sendmail(MAIL_FROM, [MAIL_TO], msg.as_string())
 
+# =====================
+# 10. MAIN
+# =====================
+def main():
+    sent = load_json(CACHE_PATH)
+    title_cache = load_json(TITLE_CACHE_PATH)
 
-# -----------------------------
-# 10) Main
-# -----------------------------
-def main() -> int:
-    cache = load_cache()
-    title_cache = load_title_cache()
+    items = []
+    for f in FEEDS:
+        items.extend(fetch(f))
 
-    all_items: List[Dict[str, Any]] = []
-    for feed in FEEDS:
-        try:
-            all_items.extend(filter_recent(fetch_feed_items(feed)))
-        except Exception:
-            traceback.print_exc()
-
-    fresh: List[Dict[str, Any]] = []
-    now_ts = time.time()
-
-    # 실행 1회 내 중복은 '링크'만 제거(매체 달라도 링크 같으면 제거)
-    seen_links = set()
-    for it in all_items:
-        key = make_key(it["category"], it["feed"], it["title"], it["link"])
-        link_key = canonicalize_url(it["link"])
-
-        if key in cache:
+    fresh = []
+    for it in items:
+        key = hashlib.sha1(f"{it['title']}{it['link']}".encode()).hexdigest()
+        if key in sent:
             continue
-        if link_key in seen_links:
-            continue
-        seen_links.add(link_key)
-
-        cache[key] = now_ts
+        sent[key] = time.time()
         fresh.append(it)
 
+    fresh.sort(key=lambda x: x["time"] or datetime.min, reverse=True)
+    fresh = (
+        [x for x in fresh if x["category"] == "US"][:MAX_US] +
+        [x for x in fresh if x["category"] == "KR"][:MAX_KR] +
+        [x for x in fresh if x["category"] == "JP"][:MAX_JP]
+    )
+
     if not fresh:
-        print("[INFO] No new items.")
-        save_cache(cache)
-        save_title_cache(title_cache)
-        return 0
+        print("NO NEW ITEMS")
+        return
 
-    # 최신순 정렬
-    fresh.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
+    html = build_html(fresh, title_cache)
+    send(f"{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}", html)
 
-    # (옵션) 배치 윈도우 - 기본 OFF
-    if BATCH_WINDOW_SECONDS > 0:
-        newest_ts = fresh[0]["time"].timestamp() if fresh[0].get("time") else now_ts
-        cutoff = newest_ts - BATCH_WINDOW_SECONDS
-        fresh = [it for it in fresh if (it.get("time").timestamp() if it.get("time") else newest_ts) >= cutoff]
+    save_json(CACHE_PATH, sent)
+    save_json(TITLE_CACHE_PATH, title_cache)
 
-    # 국가별 상한 적용(고르게)
-    us = [x for x in fresh if x["category"] == "US"][:MAX_US]
-    kr = [x for x in fresh if x["category"] == "KR"][:MAX_KR]
-    jp = [x for x in fresh if x["category"] == "JP"][:MAX_JP]
-
-    combined = us + kr + jp
-    combined.sort(key=lambda x: (x["time"].timestamp() if x["time"] else 0), reverse=True)
-
-    if MAX_ITEMS_PER_EMAIL > 0 and len(combined) > MAX_ITEMS_PER_EMAIL:
-        combined = combined[:MAX_ITEMS_PER_EMAIL]
-
-    subject = f"{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    html_body = build_email_html(combined, title_cache)
-
-    send_mail(subject, html_body)
-
-    save_cache(cache)
-    save_title_cache(title_cache)
-
-    print(f"[OK] Sent {len(combined)} items to {MAIL_TO}")
-    print(f"[INFO] Breakdown: US={len(us)} KR={len(kr)} JP={len(jp)}")
-    print(f"[INFO] Title translate: {TITLE_TRANSLATE} provider={TITLE_TRANSLATE_PROVIDER} sleep={TRANSLATE_SLEEP_SECONDS}s")
-    return 0
-
+    print(f"SENT {len(fresh)} ITEMS")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
