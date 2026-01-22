@@ -27,12 +27,24 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "").strip()
 SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
 MAIL_TO = os.getenv("MAIL_TO", "").strip()
+MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER).strip()
+
+# 메일 전송 방식 (465면 보통 SSL, 587이면 STARTTLS)
+SMTP_SSL = os.getenv("SMTP_SSL", "").strip()  # "1"이면 강제 SSL
 
 TOPN = int(os.getenv("TOPN", "30"))
-VOL_MULT = float(os.getenv("VOL_MULT", "1.2"))  # 오늘 거래량 >= 20일 평균 거래량 * VOL_MULT
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0"))
 
-# 국내주식 기간별 시세(일/주/월/년) TR
+# 거래량 필터: 오늘 거래량 >= 20일 평균 거래량 * VOL_MULT
+VOL_MULT = float(os.getenv("VOL_MULT", "1.0"))
+
+# ✅ 근접(±%) 범위 (기본 ±0.5% = 0.005)
+NEAR_PCT = float(os.getenv("NEAR_PCT", "0.005"))
+
+# ✅ 기본은 0건이면 메일 안 보냄. (테스트/확인용으로만 1로)
+SEND_EMPTY = os.getenv("SEND_EMPTY", "0").strip() == "1"
+
+# 국내주식 기간별 시세(일) TR
 TR_ID_CHART = os.getenv("KIS_TR_ID_CHART", "FHKST03010100").strip()
 
 # 과호출 방지
@@ -64,8 +76,7 @@ def download_mst_zip(url: str) -> bytes:
 def load_mst_map(zip_bytes: bytes) -> dict:
     """
     mst zip -> {code: name}
-    NOTE: mst 고정폭 포맷은 버전에 따라 조금 다를 수 있어,
-          안전하게 '앞 6자리 코드 + 이어지는 종목명 구간'을 넓게 읽습니다.
+    고정폭 포맷 차이를 감안해, 코드/이름을 넉넉히 파싱
     """
     zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
     mst_name = None
@@ -86,8 +97,6 @@ def load_mst_map(zip_bytes: bytes) -> dict:
         code = line[:6]
         if not code.isdigit():
             continue
-        # 종목명 위치는 환경마다 다를 수 있어 넉넉히 슬라이스
-        # 보통 코드 뒤에 한글 종목명이 포함됨
         name_guess = line[6:40].strip()
         if name_guess:
             m[code] = name_guess
@@ -144,9 +153,14 @@ def parse_chart(j) -> pd.DataFrame:
     return df
 
 # -----------------------------
-# Signal: 20MA "상향 진입"
+# Signal: 20MA "돌파" + "근접"
 # -----------------------------
-def calc_entry(df: pd.DataFrame):
+def calc_signals(df: pd.DataFrame):
+    """
+    return dict with:
+      - breakout (상향진입): (c1 < m1) and (c0 >= m0) and vol filter
+      - near (근접): abs(c0/m0 - 1) <= NEAR_PCT and vol filter
+    """
     if df is None or df.empty or len(df) < 25:
         return None
 
@@ -165,30 +179,30 @@ def calc_entry(df: pd.DataFrame):
     if c0 < MIN_PRICE:
         return None
 
-    # 상향 진입(어제는 아래, 오늘은 MA20 이상)
-    entry = (c1 < m1) and (c0 >= m0)
-    if not entry:
-        return None
-
     volx = (v0 / vm0) if vm0 > 0 else 0.0
     if volx < VOL_MULT:
         return None
 
     pct = ((c0 / m0) - 1.0) * 100.0 if m0 else 0.0
+    near = (abs((c0 / m0) - 1.0) <= NEAR_PCT) if m0 else False
+    breakout = (c1 < m1) and (c0 >= m0)
+
     return {
         "close": float(c0),
         "ma20": float(m0),
         "pct": float(pct),
         "volx": float(volx),
-        "date": df["date"].iloc[-1].strftime("%Y-%m-%d")
+        "date": df["date"].iloc[-1].strftime("%Y-%m-%d"),
+        "is_breakout": bool(breakout),
+        "is_near": bool(near),
     }
 
 # -----------------------------
 # Mail (HTML)
 # -----------------------------
-def build_html_table(rows):
+def build_html_table(rows, title: str):
     if not rows:
-        return "<p>조건 충족 종목 없음</p>"
+        return f"<p><b>{title}</b><br/>조건 충족 종목 없음</p>"
 
     thead = """
     <tr>
@@ -216,6 +230,7 @@ def build_html_table(rows):
         </tr>
         """)
     return f"""
+    <h3 style="margin:18px 0 8px 0;">{title}</h3>
     <table style="border-collapse:collapse;width:100%;font-size:14px;">
       <thead>{thead}</thead>
       <tbody>{''.join(trs)}</tbody>
@@ -227,17 +242,28 @@ def send_mail(subject: str, html_body: str, text_body: str):
         raise RuntimeError("SMTP 환경변수 누락(SMTP_HOST/USER/PASS/MAIL_TO)")
 
     msg = MIMEMultipart("alternative")
-    msg["From"] = SMTP_USER
+    msg["From"] = MAIL_FROM or SMTP_USER
     msg["To"] = MAIL_TO
     msg["Subject"] = subject
 
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.sendmail(SMTP_USER, [MAIL_TO], msg.as_string())
+    use_ssl = False
+    if SMTP_SSL:
+        use_ssl = (SMTP_SSL == "1")
+    else:
+        use_ssl = (SMTP_PORT == 465)
+
+    if use_ssl:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(MAIL_FROM or SMTP_USER, [MAIL_TO], msg.as_string())
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(MAIL_FROM or SMTP_USER, [MAIL_TO], msg.as_string())
 
 # -----------------------------
 # Main
@@ -247,52 +273,84 @@ def main():
     codes, name_map = get_universe()
     universe_count = len(codes)
 
-    hits = []
+    breakout_hits = []
+    near_hits = []
+
     for i, code in enumerate(codes, start=1):
         try:
             j = kis_daily_chart(token, code)
             df = parse_chart(j)
-            sig = calc_entry(df)
+            sig = calc_signals(df)
             if sig:
-                hits.append({
+                base = {
                     "code": code,
                     "name": name_map.get(code, ""),
-                    **sig
-                })
+                    "close": sig["close"],
+                    "ma20": sig["ma20"],
+                    "pct": sig["pct"],
+                    "volx": sig["volx"],
+                    "date": sig["date"],
+                }
+                if sig["is_breakout"]:
+                    breakout_hits.append(base)
+                if sig["is_near"]:
+                    near_hits.append(base)
         except Exception:
             pass
 
         if i % SLEEP_EVERY == 0:
             time.sleep(SLEEP_SEC)
 
-    # 정렬: MA20과의 절대 괴리율이 작은(=진입 직후에 가까운) 순으로
-    hits.sort(key=lambda x: abs(x["pct"]))
-    hits = hits[:TOPN]
+    # 중복 제거: 돌파에 잡힌 애는 근접에서도 빠지게(메일이 깔끔해짐)
+    breakout_codes = set([x["code"] for x in breakout_hits])
+    near_hits = [x for x in near_hits if x["code"] not in breakout_codes]
+
+    # 정렬
+    # 돌파: MA대비 괴리율이 작은 순(진입 직후)
+    breakout_hits.sort(key=lambda x: abs(x["pct"]))
+    # 근접: 절대괴리율 작은 순
+    near_hits.sort(key=lambda x: abs(x["pct"]))
+
+    breakout_hits = breakout_hits[:TOPN]
+    near_hits = near_hits[:TOPN]
 
     ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
-    subject = f"[KIS] 한국주식 20일선 진입 요약 (장마감) - {ts[:10]}"
+    subject = (
+        f"[KIS] 20일선 돌파/근접 (장마감) "
+        f"돌파{len(breakout_hits)} · 근접{len(near_hits)} - {ts[:10]}"
+    )
 
     rules = [
         "기준: 장 마감 종가 기준",
         "대상: KOSPI + KOSDAQ 전종목",
-        "조건: 어제 종가 < 어제 20MA AND 오늘 종가 ≥ 오늘 20MA",
+        "돌파: 어제 종가 < 어제 20MA AND 오늘 종가 ≥ 오늘 20MA",
+        f"근접: 오늘 종가가 오늘 20MA의 ±{NEAR_PCT*100:.2f}% 이내",
         f"거래량 필터: 오늘 거래량 ≥ 20일 평균 거래량 × {VOL_MULT}",
-        f"상위 {TOPN}종목"
+        f"각 그룹 상위 {TOPN}종목"
     ]
 
+    if (not breakout_hits) and (not near_hits) and (not SEND_EMPTY):
+        print("OK: mailed 0 rows (no candidates)")
+        return
+
     # rows format
-    rows = []
-    for idx, h in enumerate(hits, start=1):
-        rows.append({
-            "rank": idx,
-            "code": h["code"],
-            "name": h["name"],
-            "close": int(round(h["close"])),
-            "ma20": h["ma20"],
-            "pct": h["pct"],
-            "volx": h["volx"],
-            "date": h["date"]
-        })
+    def to_rows(items):
+        rows = []
+        for idx, h in enumerate(items, start=1):
+            rows.append({
+                "rank": idx,
+                "code": h["code"],
+                "name": h["name"],
+                "close": int(round(h["close"])),
+                "ma20": h["ma20"],
+                "pct": h["pct"],
+                "volx": h["volx"],
+                "date": h["date"]
+            })
+        return rows
+
+    rows_breakout = to_rows(breakout_hits)
+    rows_near = to_rows(near_hits)
 
     # HTML
     rules_html = "<br/>".join([f"- {x}" for x in rules])
@@ -308,14 +366,14 @@ def main():
         <b>집계 기준</b><br/>{rules_html}
       </div>
 
-      <h3 style="margin:18px 0 8px 0;">20일선 상향 진입 TOP {TOPN}</h3>
-      {build_html_table(rows)}
+      {build_html_table(rows_breakout, f"📈 20일선 돌파 TOP {TOPN}")}
+      {build_html_table(rows_near, f"👀 20일선 근접(±{NEAR_PCT*100:.2f}%) TOP {TOPN}")}
 
       <div style="margin-top:16px;padding:10px 12px;border:1px solid #e5e5e5;border-radius:8px;">
         <b>해석 가이드</b><br/>
-        - 20일선 진입은 단기 추세 전환 후보 신호<br/>
-        - 거래량 배수가 높을수록 신뢰도 ↑<br/>
-        - 다음 관찰: 20MA 재이탈 여부 / 다음날 연속 양봉 여부
+        - 돌파: 단기 추세 전환 후보(다음날 유지 여부 확인)<br/>
+        - 근접: 다음날 장중 돌파/이탈 후보(관찰 리스트)<br/>
+        - 거래량 배수가 높을수록 신뢰도 ↑
       </div>
 
       <p style="margin-top:14px;color:#666;font-size:12px;">
@@ -326,13 +384,14 @@ def main():
 
     # TEXT
     rules_text = "\n".join([f"- {x}" for x in rules])
-    if rows:
-        lines = "\n".join([
+
+    def fmt_lines(rows):
+        if not rows:
+            return "조건 충족 종목 없음"
+        return "\n".join([
             f"{r['rank']:>2}. {r['code']} {r['name']} | 종가 {r['close']:,} | 20MA {r['ma20']:.1f} | {r['pct']:+.2f}% | {r['volx']:.2f}x | {r['date']}"
             for r in rows
         ])
-    else:
-        lines = "조건 충족 종목 없음"
 
     text = f"""{subject}
 
@@ -345,14 +404,18 @@ def main():
 [집계 기준]
 {rules_text}
 
-[20일선 상향 진입 TOP {TOPN}]
-{lines}
+[📈 20일선 돌파 TOP {TOPN}]
+{fmt_lines(rows_breakout)}
+
+[👀 20일선 근접(±{NEAR_PCT*100:.2f}%) TOP {TOPN}]
+{fmt_lines(rows_near)}
 
 ※ 본 메일은 한국투자증권(KIS) OpenAPI 기반으로 장 마감 후 자동 생성·발송됩니다.
 """
 
     send_mail(subject, html, text)
-    print(f"OK: mailed {len(rows)} rows")
+    mailed_count = len(rows_breakout) + len(rows_near)
+    print(f"OK: mailed {mailed_count} rows (breakout={len(rows_breakout)}, near={len(rows_near)})")
 
 if __name__ == "__main__":
     main()
