@@ -8,7 +8,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25  # ✅ job 전체 무한 방지
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
@@ -24,8 +24,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas requests
 
-      - name: Run MA20 Entry & Send Mail
-        timeout-minutes: 20  # ✅ step 무한 방지
+      - name: Check required env
+        run: |
+          python - << 'PY'
+          import os
+          keys = [
+            "KIS_APPKEY","KIS_APPSECRET","KIS_BASE_URL","KIS_KOSPI_MST_URL","KIS_KOSDAQ_MST_URL",
+            "GMAIL_USER","GMAIL_APP_PASS","HANMAIL_TO",
+            "TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"
+          ]
+          for k in keys:
+            v = os.getenv(k, "")
+            print(f"{k}={'OK' if v else 'MISSING'}")
+          PY
         env:
           KIS_APPKEY: ${{ secrets.KIS_APPKEY }}
           KIS_APPSECRET: ${{ secrets.KIS_APPSECRET }}
@@ -36,6 +47,26 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           HANMAIL_TO: ${{ secrets.HANMAIL_TO }}
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Run MA20 Entry & Send (Mail + Telegram)
+        timeout-minutes: 30
+        env:
+          KIS_APPKEY: ${{ secrets.KIS_APPKEY }}
+          KIS_APPSECRET: ${{ secrets.KIS_APPSECRET }}
+          KIS_BASE_URL: ${{ secrets.KIS_BASE_URL }}
+          KIS_KOSPI_MST_URL: ${{ secrets.KIS_KOSPI_MST_URL }}
+          KIS_KOSDAQ_MST_URL: ${{ secrets.KIS_KOSDAQ_MST_URL }}
+
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
+          HANMAIL_TO: ${{ secrets.HANMAIL_TO }}
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: "465"
 
@@ -43,11 +74,9 @@ jobs:
           VOL_MULT: "1.0"
           NEAR_PCT: "0.005"
 
-          # ✅ 처음엔 테스트 모드 권장
           FULL_SCAN: "0"
           TEST_LIMIT: "400"
 
-          # ✅ 네트워크 안전장치
           REQ_TIMEOUT: "15"
           MAX_RETRY: "2"
           RETRY_SLEEP: "0.6"
