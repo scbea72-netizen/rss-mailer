@@ -67,7 +67,6 @@ jobs:
           header = p["meta"]["header"]
           items = p.get("items", [])[:5]
 
-          # ✅ 텔레그램에 안전한 아주 짧은 메시지
           lines = [header, "TOP 5"]
           for i, it in enumerate(items, 1):
               lines.append(f"{i}. {it['name']}({it['code']}) {it['chg%']:.1f}% RSI{it['rsi14']:.0f} S{it['score']}")
@@ -86,4 +85,38 @@ jobs:
               print("Body:", body[:2000])
           except URLError as e:
               print("URLError:", str(e))
+          PY
+
+      - name: Send Gmail (KR close scan)
+        continue-on-error: true
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: |
+          python - << 'PY'
+          import os, smtplib
+          from email.mime.text import MIMEText
+
+          user = (os.getenv("GMAIL_USER") or "").strip()
+          app  = (os.getenv("GMAIL_APP_PASSWORD") or "").strip()
+          to   = (os.getenv("TO_EMAIL") or "").strip()
+
+          if not user or not app or not to:
+              print("Gmail secrets not set. Skip.")
+              raise SystemExit(0)
+
+          with open("out/scan_close_kr.txt","r",encoding="utf-8") as f:
+              body = f.read()
+
+          msg = MIMEText(body, _charset="utf-8")
+          msg["Subject"] = "[KR CLOSE SCAN] Finalists"
+          msg["From"] = user
+          msg["To"] = to
+
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+              s.login(user, app)
+              s.sendmail(user, [to], msg.as_string())
+
+          print("Gmail sent")
           PY
