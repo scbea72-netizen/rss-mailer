@@ -1,23 +1,43 @@
 name: EOD MA20 Close (US/JP)
 
 on:
-  schedule:
-    - cron: "30 21 * * *"   # 미국/일본 장마감 후
   workflow_dispatch:
+  schedule:
+    - cron: "40 6 * * 1-5"  # 평일 15:40 KST (UTC 06:40)
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install pandas requests
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests
+
       - name: Run EOD scan
+        timeout-minutes: 15
         env:
           EOD_API_KEY: ${{ secrets.EOD_API_KEY }}
+
+          # ✅ 메일 관련 공통 ENV (여기가 빠져서 지금 에러난 것)
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           HANMAIL_TO: ${{ secrets.HANMAIL_TO }}
-        run: python eod_ma20_close.py
+
+          SMTP_HOST: smtp.gmail.com
+          SMTP_PORT: "465"
+
+          TOPN: "30"
+          NEAR_PCT: "0.005"
+        run: |
+          python eod_ma20_close.py
