@@ -11,9 +11,6 @@ from email.mime.text import MIMEText
 
 KST = timezone(timedelta(hours=9))
 
-# -----------------------------
-# ENV (유연 + 명확)
-# -----------------------------
 KIS_APPKEY = os.getenv("KIS_APPKEY", "").strip()
 KIS_APPSECRET = os.getenv("KIS_APPSECRET", "").strip()
 KIS_BASE_URL = os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443").strip()
@@ -25,15 +22,16 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("GMAIL_USER", "").strip()
 SMTP_PASS = os.getenv("GMAIL_APP_PASS", "").strip()
 
-# 수신자: HANMAIL_TO 기준 (여러 주소 허용)
 MAIL_TO_RAW = (os.getenv("HANMAIL_TO") or "").strip()
 MAIL_FROM = SMTP_USER
+
+TG_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TG_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 TOPN = int(os.getenv("TOPN", "30"))
 VOL_MULT = float(os.getenv("VOL_MULT", "1.0"))
 NEAR_PCT = float(os.getenv("NEAR_PCT", "0.005"))
 
-# 안전 옵션
 TEST_LIMIT = int(os.getenv("TEST_LIMIT", "400"))
 FULL_SCAN = os.getenv("FULL_SCAN", "0").strip() == "1"
 
@@ -66,31 +64,11 @@ def must_env():
     if miss:
         raise RuntimeError("Missing ENV: " + ", ".join(miss))
 
-# -----------------------------
-# ETF 판별
-# -----------------------------
-def is_etf(name: str) -> bool:
-    if not name:
-        return False
-    etf_keywords = [
-        "KODEX", "TIGER", "KBSTAR", "ARIRANG",
-        "HANARO", "KOSEF", "ACE", "SOL", "TIMEFOLIO"
-    ]
-    up = name.upper()
-    return any(k in up for k in etf_keywords)
-
-# -----------------------------
-# HTTP helper
-# -----------------------------
 def request_with_retry(method, url, *, headers=None, params=None, json=None, timeout=REQ_TIMEOUT):
     last_err = None
     for attempt in range(1, MAX_RETRY + 2):
         try:
-            r = session.request(
-                method, url,
-                headers=headers, params=params, json=json,
-                timeout=timeout
-            )
+            r = session.request(method, url, headers=headers, params=params, json=json, timeout=timeout)
             r.raise_for_status()
             return r
         except Exception as e:
@@ -98,18 +76,27 @@ def request_with_retry(method, url, *, headers=None, params=None, json=None, tim
             time.sleep(RETRY_SLEEP)
     raise last_err
 
-# -----------------------------
-# KIS API
-# -----------------------------
+def tg_send(text: str):
+    if not (TG_TOKEN and TG_CHAT_ID):
+        print("[TG] token/chat_id missing -> skip", flush=True)
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    chunks = []
+    s = text
+    while len(s) > 3900:
+        chunks.append(s[:3900])
+        s = s[3900:]
+    chunks.append(s)
+
+    for c in chunks:
+        r = requests.post(url, data={"chat_id": TG_CHAT_ID, "text": c}, timeout=15)
+        r.raise_for_status()
+
 def kis_token():
     r = request_with_retry(
         "POST",
         f"{KIS_BASE_URL}/oauth2/tokenP",
-        json={
-            "grant_type": "client_credentials",
-            "appkey": KIS_APPKEY,
-            "appsecret": KIS_APPSECRET
-        },
+        json={"grant_type": "client_credentials", "appkey": KIS_APPKEY, "appsecret": KIS_APPSECRET},
         timeout=REQ_TIMEOUT
     )
     return r.json()["access_token"]
@@ -177,9 +164,13 @@ def industry_name(token, code):
     )
     return (r.json().get("output", {}).get("bstp_kor_isnm") or "기타").strip()
 
-# -----------------------------
-# Signal
-# -----------------------------
+def is_etf(name: str) -> bool:
+    if not name:
+        return False
+    etf_keywords = ["KODEX","TIGER","KBSTAR","ARIRANG","HANARO","KOSEF","ACE","SOL","TIMEFOLIO"]
+    up = name.upper()
+    return any(k in up for k in etf_keywords)
+
 def parse_df(j):
     rows = []
     for it in j.get("output2", []):
@@ -230,24 +221,19 @@ def signal(df):
         "near": near
     }
 
-# -----------------------------
-# Mail (핵심 수정)
-# -----------------------------
 def send_mail(hits_b, hits_n):
     to_list = parse_recipients(MAIL_TO_RAW)
     if not to_list:
-        raise RuntimeError("HANMAIL_TO is empty or invalid")
+        raise RuntimeError("HANMAIL_TO invalid")
 
     def fmt_rows(items):
         return "\n".join(
-            f"[{x['type']}] {x['code']} {x['name']} | {x['industry']} | "
-            f"{x['pct']:+.2f}% | {x['volx']:.2f}x"
+            f"[{x['type']}] {x['code']} {x['name']} | {x['industry']} | {x['pct']:+.2f}% | {x['volx']:.2f}x"
             for x in items
         )
 
     subject = f"[KIS] 20일선 돌파 {len(hits_b)} / 근접 {len(hits_n)}"
-    body = f"""\
-[📈 돌파]
+    body = f"""[📈 돌파]
 {fmt_rows(hits_b) or '없음'}
 
 [👀 근접]
@@ -261,14 +247,11 @@ def send_mail(hits_b, hits_n):
 
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
         s.login(SMTP_USER, SMTP_PASS)
-        # ✅ send_message() 대신 sendmail()
         s.sendmail(MAIL_FROM, to_list, msg.as_string())
 
     print(f"[MAIL] sent ok -> {to_list}", flush=True)
+    return subject, body
 
-# -----------------------------
-# Main
-# -----------------------------
 def main():
     must_env()
 
@@ -338,9 +321,14 @@ def main():
 
     print(f"[RESULT] breakout={len(hits_b)} near={len(hits_n)}", flush=True)
 
-    send_mail(hits_b, hits_n)
-    print("[OK] mail sent", flush=True)
+    out = send_mail(hits_b, hits_n)
+
+    # 텔레그램도 같이
+    if out:
+        subject, body = out
+        tg_send(subject + "\n" + body)
+
+    print("[OK] done", flush=True)
 
 if __name__ == "__main__":
     main()
-
