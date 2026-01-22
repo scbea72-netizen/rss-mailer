@@ -3,3 +3,4 @@ numpy>=1.23,<2.0
 yfinance>=0.2
 finance-datareader
 feedparser
+exchange_calendars
