@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-rss_digest.py (RSS 뉴스 메일러 – 최종 안정판 / 시크릿 자동매핑)
+rss_digest.py (RSS 뉴스 메일러 – 최종 안정판 / 시크릿 자동매핑 + 진단로그 강화)
 
 정책
 - KR: 제목 그대로
@@ -13,8 +13,8 @@ rss_digest.py (RSS 뉴스 메일러 – 최종 안정판 / 시크릿 자동매�
 개선(중요)
 - GitHub Secrets 이름이 SMTP_*가 아니어도 자동 인식:
   SMTP_* 우선 → HANMAIL_* → GMAIL_* 순으로 fallback
-- SMTP 인증 실패(535)는 fallback으로 해결 안 되므로,
-  원인 안내 메시지를 명확히 출력
+- SMTP 인증 실패(535)는 "대부분 계정/앱비번/허용설정" 문제라
+  원인 안내 메시지 + 진단 정보를 명확히 출력
 - SSL(465) 우선, 네트워크 이슈일 때만 STARTTLS(587) 시도
 """
 
@@ -45,7 +45,7 @@ MAX_KR = int(os.getenv("MAX_KR", "25"))
 MAX_JP = int(os.getenv("MAX_JP", "25"))
 MAX_ITEMS_PER_EMAIL = int(os.getenv("MAX_ITEMS_PER_EMAIL", "120"))
 
-TITLE_TRANSLATE = os.getenv("TITLE_TRANSLATE", "1").strip() in ("1", "true", "yes", "on")
+TITLE_TRANSLATE = os.getenv("TITLE_TRANSLATE", "1").strip().lower() in ("1", "true", "yes", "on")
 TRANSLATE_SLEEP_SECONDS = float(os.getenv("TRANSLATE_SLEEP_SECONDS", "1.0"))
 
 USER_AGENT = os.getenv(
@@ -88,6 +88,14 @@ def _env_any(*keys: str, default: str = "") -> str:
         if v is not None and str(v).strip() != "":
             return str(v).strip()
     return default
+
+def _mask(s: str, keep: int = 3) -> str:
+    if not s:
+        return "EMPTY"
+    s = str(s)
+    if len(s) <= keep:
+        return s[0] + "***"
+    return s[:keep] + "***"
 
 # Host/Port: SMTP_HOST 우선, 없으면 HANMAIL용 기본값
 SMTP_HOST = _env_any("SMTP_HOST", "HANMAIL_SMTP_HOST", default="smtp.daum.net")
@@ -209,7 +217,11 @@ def fetch(feed: Dict[str, str]) -> List[Dict[str, Any]]:
 # 8. MAIL HTML
 # =====================
 def build_html(items: List[Dict[str, Any]], title_cache: Dict[str, str]) -> str:
-    out = [f"<h2>{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}</h2><hr/>"]
+    out = [
+        f"<h2>{SUBJECT_PREFIX} {datetime.now().strftime('%Y-%m-%d %H:%M')}</h2>",
+        "<p style='color:#666'>※ 한국은 원문 / 미국·일본은 <b>제목만</b> 한글 번역(무료)으로 발송됩니다.</p>",
+        "<hr/>"
+    ]
     for cat in ("US", "KR", "JP"):
         group = [x for x in items if x["category"] == cat]
         if not group:
@@ -224,13 +236,16 @@ def build_html(items: List[Dict[str, Any]], title_cache: Dict[str, str]) -> str:
     return "\n".join(out)
 
 # =====================
-# 9. SEND (ROBUST)
+# 9. SEND (ROBUST + DIAG)
 # =====================
 def send(subject: str, html: str) -> None:
+    # 진단 정보(마스킹)
+    print(f"[DIAG] SMTP_HOST={SMTP_HOST} PORT={SMTP_PORT} USER={_mask(SMTP_USER)} TO={_mask(MAIL_TO)} FROM={_mask(MAIL_FROM)}")
+
     if not SMTP_USER or not SMTP_PASS:
         raise RuntimeError(
             "SMTP 계정 정보가 비어있음. "
-            "GitHub Secrets에 HANMAIL_USER/HANMAIL_PASS 또는 SMTP_USER/SMTP_PASS 또는 GMAIL_USER/GMAIL_APP_PASS를 설정하세요."
+            "GitHub Secrets에 HANMAIL_USER/HANMAIL_PASS(권장) 또는 SMTP_USER/SMTP_PASS 또는 GMAIL_USER/GMAIL_APP_PASS를 설정하세요."
         )
     if not MAIL_TO:
         raise RuntimeError("수신자(MAIL_TO/HANMAIL_TO)가 비어있음")
@@ -246,14 +261,15 @@ def send(subject: str, html: str) -> None:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
             s.login(SMTP_USER, SMTP_PASS)
             s.sendmail(msg["From"], [MAIL_TO], msg.as_string())
+            print("[OK] SMTP_SSL sent")
             return
 
     except smtplib.SMTPAuthenticationError as e:
-        # ✅ 535는 보통 앱비밀번호/비번오류/SMTP허용 OFF
         raise RuntimeError(
             "SMTP 인증 실패(535). "
-            "HANMAIL_PASS가 '앱 비밀번호'인지 확인하고, HANMAIL_USER가 전체 이메일 주소인지 확인하세요. "
-            "또한 한메일 계정 보안설정에서 외부앱(SMTP) 허용/앱비밀번호 발급이 필요할 수 있습니다."
+            "① HANMAIL_USER가 전체 이메일 주소인지 확인 "
+            "② HANMAIL_PASS가 '앱 비밀번호'인지 확인 "
+            "③ 한메일 계정 보안설정에서 외부앱(SMTP) 허용/앱비밀번호 발급 필요할 수 있음"
         ) from e
 
     except Exception:
@@ -265,6 +281,7 @@ def send(subject: str, html: str) -> None:
                 s.ehlo()
                 s.login(SMTP_USER, SMTP_PASS)
                 s.sendmail(msg["From"], [MAIL_TO], msg.as_string())
+                print("[OK] STARTTLS sent")
                 return
         except Exception as e2:
             raise RuntimeError(f"SMTP 전송 실패(SSL/STARTTLS 모두 실패): {e2}") from e2
@@ -281,7 +298,7 @@ def main():
     for f in FEEDS:
         items.extend(fetch(f))
 
-    # 2) 너무 오래된 뉴스 제거(옵션)
+    # 2) 너무 오래된 뉴스 제거
     if MAX_AGE_HOURS > 0:
         cutoff = datetime.now(timezone.utc).timestamp() - MAX_AGE_HOURS * 3600
         items = [it for it in items if not it["time"] or it["time"].timestamp() >= cutoff]
@@ -309,7 +326,7 @@ def main():
         combined = combined[:MAX_ITEMS_PER_EMAIL]
 
     if not combined:
-        print("NO NEW ITEMS")
+        print("[INFO] NO NEW ITEMS")
         save_json(CACHE_PATH, sent)
         save_json(TITLE_CACHE_PATH, title_cache)
         return
@@ -321,8 +338,7 @@ def main():
     save_json(CACHE_PATH, sent)
     save_json(TITLE_CACHE_PATH, title_cache)
 
-    print(f"SENT {len(combined)} ITEMS | US={len(us)} KR={len(kr)} JP={len(jp)}")
-    print(f"SMTP_HOST={SMTP_HOST} PORT={SMTP_PORT} USER={(SMTP_USER[:3] + '***') if SMTP_USER else 'EMPTY'} TO={MAIL_TO}")
+    print(f"[OK] SENT {len(combined)} ITEMS | US={len(us)} KR={len(kr)} JP={len(jp)}")
 
 if __name__ == "__main__":
     main()
