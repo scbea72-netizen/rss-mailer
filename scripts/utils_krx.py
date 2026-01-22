@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List
+import time
+import random
 
 import pandas as pd
 import exchange_calendars as ecals
@@ -14,24 +16,17 @@ class TradingDay:
 
 
 def recent_trading_days(n: int, end_date: str | None = None) -> List[TradingDay]:
-    """
-    ✅ 최종 안정판 (영원히 안 깨짐)
-    - 거래일 계산: exchange_calendars(XKRX)로 로컬 계산 (네트워크/pykrx 지수 API 의존 없음)
-    - exchange_calendars는 tz-aware Timestamp에 민감하므로 tz-naive 날짜만 전달
-    """
     if n <= 0:
         return []
 
     cal = ecals.get_calendar("XKRX")
 
-    # exchange_calendars에는 timezone 없는 (tz-naive) 날짜만 넘긴다
     if end_date:
         end = pd.Timestamp(end_date).normalize()
     else:
         end = pd.Timestamp.now().normalize()
 
     start = end - pd.Timedelta(days=365)
-
     sessions = cal.sessions_in_range(start, end)
 
     if sessions is None or len(sessions) < n:
@@ -41,31 +36,66 @@ def recent_trading_days(n: int, end_date: str | None = None) -> List[TradingDay]
     return [TradingDay(d.strftime("%Y%m%d")) for d in days]
 
 
-def fetch_bulk_ohlcv_for_date(date_yyyymmdd: str) -> pd.DataFrame:
+def _get_market_ohlcv_safe(date_yyyymmdd: str, market: str) -> pd.DataFrame | None:
     """
-    특정 거래일의 KOSPI+KOSDAQ 전종목 OHLCV/거래대금(금액)을 벌크로 가져와 통합.
+    pykrx 호출을 안전하게 감싸는 래퍼:
+    - 일시 장애/차단/빈 응답 시 None 반환
+    - retry/backoff는 상위에서 처리
+    """
+    try:
+        df = stock.get_market_ohlcv_by_ticker(date_yyyymmdd, market=market)
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception:
+        return None
 
-    반환 컬럼:
-    - ticker, name, close, value, date, market
+
+def fetch_bulk_ohlcv_for_date(date_yyyymmdd: str, max_retry: int = 6) -> pd.DataFrame:
+    """
+    ✅ 운영급(안깨짐) 벌크 수집
+    - pykrx/KRX 응답 흔들림 대비: 재시도 + 컬럼검증 + 빈응답 방어
+    - 반환 컬럼: ticker, name, close, value, date, market
     """
     frames = []
+    required_cols = {"시가", "고가", "저가", "종가", "거래대금"}
 
     for market in ("KOSPI", "KOSDAQ"):
-        df = stock.get_market_ohlcv_by_ticker(date_yyyymmdd, market=market)
+        df = None
 
-        if df is None or df.empty:
+        # 재시도 + 지수 백오프(1s,2s,4s...) + 지터
+        for attempt in range(1, max_retry + 1):
+            df = _get_market_ohlcv_safe(date_yyyymmdd, market)
+
+            if df is not None and len(df.columns) > 0:
+                # pykrx가 컬럼을 다르게 주거나 깨진 경우 방어
+                cols = set(map(str, df.columns))
+                if required_cols.issubset(cols):
+                    break  # 성공
+                else:
+                    df = None  # 깨진 응답 취급
+
+            sleep_s = min(60, (2 ** (attempt - 1))) + random.random()
+            print(f"[WARN] pykrx fetch failed/invalid ({market}) date={date_yyyymmdd} attempt={attempt}/{max_retry} sleep={sleep_s:.1f}s")
+            time.sleep(sleep_s)
+
+        if df is None:
+            # 이 시장은 포기(하지만 다른 시장이라도 모으면 진행)
+            print(f"[ERROR] pykrx fetch FAILED ({market}) date={date_yyyymmdd} after {max_retry} retries")
             continue
 
         df = df.reset_index().rename(columns={"티커": "ticker"})
+        df["ticker"] = df["ticker"].astype(str)
 
-        # pykrx 컬럼명 방어
-        if "종가" not in df.columns or "거래대금" not in df.columns:
-            raise RuntimeError(f"pykrx 응답 컬럼이 예상과 다릅니다: {list(df.columns)}")
+        tickers = df["ticker"].tolist()
 
-        tickers = df["ticker"].astype(str).tolist()
-
-        # 종목명 매핑 (필요시 향후 캐시 가능)
-        names = [stock.get_market_ticker_name(t) for t in tickers]
+        # 종목명은 종종 느리므로: 실패해도 빈값으로
+        names = []
+        for t in tickers:
+            try:
+                names.append(stock.get_market_ticker_name(t))
+            except Exception:
+                names.append("")
 
         out = pd.DataFrame({
             "ticker": tickers,
@@ -79,8 +109,7 @@ def fetch_bulk_ohlcv_for_date(date_yyyymmdd: str) -> pd.DataFrame:
         frames.append(out)
 
     if not frames:
-        raise RuntimeError(f"{date_yyyymmdd} 데이터 수집 실패(휴장/지연/차단 가능)")
+        raise RuntimeError(f"{date_yyyymmdd} 데이터 수집 전체 실패(차단/장애/휴장 가능)")
 
-    merged = pd.concat(frames, ignore_index=True)
-    merged = merged.drop_duplicates(subset=["ticker", "date"], keep="last")
+    merged = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["ticker", "date"], keep="last")
     return merged
