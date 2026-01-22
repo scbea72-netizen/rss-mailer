@@ -1,4 +1,3 @@
-pandas==2.2.3
-pykrx==1.0.48
-requests==2.32.3
-python-dateutil==2.9.0.post0
+# DO NOT USE.
+# Use requirements_rss.txt for RSS workflow
+# Use requirements_krx.txt for KRX MA20 workflow
