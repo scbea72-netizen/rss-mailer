@@ -1,18 +1,26 @@
-name: KRX MA20 Close 15:40 (KR)
+name: KRX MA20 Close Scan (Mail + Telegram)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "40 6 * * 1-5" # 평일 15:40 KST (UTC 06:40)
+    # KST 기준 18:10 (UTC 09:10)
+    - cron: "10 9 * * 1-5"
+  workflow_dispatch:
 
-concurrency:
-  group: krx-ma20-close
-  cancel-in-progress: true
+env:
+  TZ: Asia/Seoul
+
+  # ===== 스캔 파라미터 =====
+  TOP_N: "50"                 # 결과 상위 N개
+  VALUE_FLOOR: "5000000000"   # 거래대금 하한 (50억)
+  NEAR_PCT: "0.01"            # MA20 근접 범위 ±1%
+
+  # ===== 거래일 수집 전략 =====
+  TRADING_DAYS: "25"          # 실제 분석에 사용할 거래일 수
+  FETCH_DAYS: "45"            # 수집 시도 거래일 수 (여유분)
 
 jobs:
   scan-and-notify:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -23,44 +31,29 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps (KRX only)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements_krx.txt
-
-      - name: Check required env
-        shell: bash
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SMTP_USER: ${{ secrets.SMTP_USER || secrets.GMAIL_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS || secrets.GMAIL_APP_PASS }}
-          MAIL_TO: ${{ secrets.MAIL_TO || secrets.HANMAIL_TO }}
-        run: |
-          python - << 'PY'
-          import os
-          keys = ["TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","SMTP_USER","SMTP_PASS","MAIL_TO"]
-          for k in keys:
-              v = os.getenv(k, "")
-              print(f"{k}={'OK' if v else 'MISSING'}")
-          PY
+          pip install -r requirements.txt
+          pip install -U pykrx exchange-calendars pandas pytz
 
       - name: Run KRX MA20 scan (Mail + Telegram)
         env:
-          # 출력 옵션
-          TOP_N: "50"
-          VALUE_FLOOR: "5000000000"   # 50억
-          NEAR_PCT: "0.01"            # 1%
+          # ===== 메일 =====
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO:   ${{ secrets.MAIL_TO }}
 
-          # Telegram
+          # ===== Telegram =====
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # Email (Gmail SMTP) - fallback 지원
-          SMTP_HOST: "smtp.gmail.com"
-          SMTP_PORT: "587"
-          SMTP_USER: ${{ secrets.SMTP_USER || secrets.GMAIL_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS || secrets.GMAIL_APP_PASS }}
-          MAIL_TO: ${{ secrets.MAIL_TO || secrets.HANMAIL_TO }}
         run: |
           python scripts/ma20_scan_kr.py
+
+      - name: Job completed
+        run: echo "KRX MA20 scan finished"
+
