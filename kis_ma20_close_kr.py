@@ -51,6 +51,9 @@ TR_ID_CHART = os.getenv("KIS_TR_ID_CHART", "FHKST03010100").strip()
 SLEEP_EVERY = int(os.getenv("SLEEP_EVERY", "25"))
 SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0.25"))
 
+# 업종 조회 TR(현재가) – 업종명(bstp_kor_isnm) 사용
+TR_ID_PRICE = os.getenv("KIS_TR_ID_PRICE", "FHKST01010100").strip()
+
 # -----------------------------
 # KIS
 # -----------------------------
@@ -126,6 +129,27 @@ def kis_daily_chart(token: str, code: str):
     r = requests.get(url, headers=headers, params=params, timeout=20)
     r.raise_for_status()
     return r.json()
+
+def kis_industry_name(token: str, code: str) -> str:
+    """
+    업종명(대분류, 한국어) 조회: output.bstp_kor_isnm
+    (없는 경우 '기타')
+    """
+    url = f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-price"
+    headers = {
+        "authorization": f"Bearer {token}",
+        "appkey": KIS_APPKEY,
+        "appsecret": KIS_APPSECRET,
+        "tr_id": TR_ID_PRICE,
+    }
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": code,
+    }
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    out = r.json().get("output", {}) or {}
+    return (out.get("bstp_kor_isnm") or "기타").strip() or "기타"
 
 def parse_chart(j) -> pd.DataFrame:
     output = j.get("output2") or j.get("output1") or j.get("output") or []
@@ -208,6 +232,7 @@ def build_html_table(rows, title: str):
     <tr>
       <th style="padding:8px;border:1px solid #ddd;">#</th>
       <th style="padding:8px;border:1px solid #ddd;">종목</th>
+      <th style="padding:8px;border:1px solid #ddd;">업종</th>
       <th style="padding:8px;border:1px solid #ddd;">종가</th>
       <th style="padding:8px;border:1px solid #ddd;">20MA</th>
       <th style="padding:8px;border:1px solid #ddd;">MA대비</th>
@@ -222,6 +247,7 @@ def build_html_table(rows, title: str):
         <tr>
           <td style="padding:8px;border:1px solid #ddd;text-align:center;">{r["rank"]}</td>
           <td style="padding:8px;border:1px solid #ddd;">{r["code"]} {r["name"]}</td>
+          <td style="padding:8px;border:1px solid #ddd;">{r.get("industry","기타")}</td>
           <td style="padding:8px;border:1px solid #ddd;text-align:right;">{r["close"]:,}</td>
           <td style="padding:8px;border:1px solid #ddd;text-align:right;">{r["ma20"]:.1f}</td>
           <td style="padding:8px;border:1px solid #ddd;text-align:right;">{sign}{r["pct"]:.2f}%</td>
@@ -236,6 +262,19 @@ def build_html_table(rows, title: str):
       <tbody>{''.join(trs)}</tbody>
     </table>
     """
+
+def group_by_industry(items: list[dict]) -> dict:
+    """
+    업종명 -> items
+    * 업종별로 abs(pct) 작은 순으로 이미 정렬된 상태를 유지
+    * 업종 섹션 순서는 '종목 수 많은 업종' 우선으로 보여줌
+    """
+    g = {}
+    for it in items:
+        ind = (it.get("industry") or "기타").strip() or "기타"
+        g.setdefault(ind, []).append(it)
+    # 섹션 정렬: 건수 desc, 이름 asc
+    return dict(sorted(g.items(), key=lambda kv: (-len(kv[1]), kv[0])))
 
 def send_mail(subject: str, html_body: str, text_body: str):
     if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_TO):
@@ -276,15 +315,27 @@ def main():
     breakout_hits = []
     near_hits = []
 
+    industry_cache = {}  # code -> industry name
+
     for i, code in enumerate(codes, start=1):
         try:
             j = kis_daily_chart(token, code)
             df = parse_chart(j)
             sig = calc_signals(df)
+
             if sig:
+                # ✅ 업종명은 "신호 후보"에만 조회 (호출량 절감) + 캐시
+                if code not in industry_cache:
+                    try:
+                        industry_cache[code] = kis_industry_name(token, code)
+                    except Exception:
+                        industry_cache[code] = "기타"
+                industry = industry_cache.get(code, "기타")
+
                 base = {
                     "code": code,
                     "name": name_map.get(code, ""),
+                    "industry": industry,
                     "close": sig["close"],
                     "ma20": sig["ma20"],
                     "pct": sig["pct"],
@@ -326,7 +377,8 @@ def main():
         "돌파: 어제 종가 < 어제 20MA AND 오늘 종가 ≥ 오늘 20MA",
         f"근접: 오늘 종가가 오늘 20MA의 ±{NEAR_PCT*100:.2f}% 이내",
         f"거래량 필터: 오늘 거래량 ≥ 20일 평균 거래량 × {VOL_MULT}",
-        f"각 그룹 상위 {TOPN}종목"
+        f"각 그룹 상위 {TOPN}종목",
+        "표시는 KIS 업종명(bstp_kor_isnm) 기준으로 자동 분리"
     ]
 
     if (not breakout_hits) and (not near_hits) and (not SEND_EMPTY):
@@ -341,6 +393,7 @@ def main():
                 "rank": idx,
                 "code": h["code"],
                 "name": h["name"],
+                "industry": h.get("industry", "기타"),
                 "close": int(round(h["close"])),
                 "ma20": h["ma20"],
                 "pct": h["pct"],
@@ -349,11 +402,32 @@ def main():
             })
         return rows
 
-    rows_breakout = to_rows(breakout_hits)
-    rows_near = to_rows(near_hits)
+    rows_breakout_all = to_rows(breakout_hits)
+    rows_near_all = to_rows(near_hits)
+
+    # 업종별 그룹핑(표 섹션 분리)
+    breakout_groups = group_by_industry(rows_breakout_all)
+    near_groups = group_by_industry(rows_near_all)
 
     # HTML
     rules_html = "<br/>".join([f"- {x}" for x in rules])
+
+    html_sections = []
+
+    html_sections.append(f"<h2 style='margin:18px 0 8px 0;'>📈 20일선 돌파 (업종별, 최대 {TOPN})</h2>")
+    if not rows_breakout_all:
+        html_sections.append("<p>조건 충족 종목 없음</p>")
+    else:
+        for ind, rows in breakout_groups.items():
+            html_sections.append(build_html_table(rows, f"{ind}"))
+
+    html_sections.append(f"<h2 style='margin:24px 0 8px 0;'>👀 20일선 근접 (업종별, ±{NEAR_PCT*100:.2f}%, 최대 {TOPN})</h2>")
+    if not rows_near_all:
+        html_sections.append("<p>조건 충족 종목 없음</p>")
+    else:
+        for ind, rows in near_groups.items():
+            html_sections.append(build_html_table(rows, f"{ind}"))
+
     html = f"""
     <div style="font-family:Apple SD Gothic Neo, Malgun Gothic, Arial, sans-serif;line-height:1.6;">
       <h2 style="margin:0 0 8px 0;">{subject}</h2>
@@ -366,8 +440,7 @@ def main():
         <b>집계 기준</b><br/>{rules_html}
       </div>
 
-      {build_html_table(rows_breakout, f"📈 20일선 돌파 TOP {TOPN}")}
-      {build_html_table(rows_near, f"👀 20일선 근접(±{NEAR_PCT*100:.2f}%) TOP {TOPN}")}
+      {''.join(html_sections)}
 
       <div style="margin-top:16px;padding:10px 12px;border:1px solid #e5e5e5;border-radius:8px;">
         <b>해석 가이드</b><br/>
@@ -385,13 +458,19 @@ def main():
     # TEXT
     rules_text = "\n".join([f"- {x}" for x in rules])
 
-    def fmt_lines(rows):
-        if not rows:
-            return "조건 충족 종목 없음"
-        return "\n".join([
-            f"{r['rank']:>2}. {r['code']} {r['name']} | 종가 {r['close']:,} | 20MA {r['ma20']:.1f} | {r['pct']:+.2f}% | {r['volx']:.2f}x | {r['date']}"
-            for r in rows
-        ])
+    def fmt_group_text(title: str, grouped: dict) -> str:
+        if not grouped:
+            return f"[{title}]\n조건 충족 종목 없음\n"
+        blocks = [f"[{title}]"]
+        for ind, rows in grouped.items():
+            blocks.append(f"\n■ {ind} ({len(rows)})")
+            for r in rows:
+                blocks.append(
+                    f"{r['rank']:>2}. {r['code']} {r['name']} | 업종:{r.get('industry','기타')} | "
+                    f"종가 {r['close']:,} | 20MA {r['ma20']:.1f} | {r['pct']:+.2f}% | "
+                    f"{r['volx']:.2f}x | {r['date']}"
+                )
+        return "\n".join(blocks) + "\n"
 
     text = f"""{subject}
 
@@ -404,18 +483,16 @@ def main():
 [집계 기준]
 {rules_text}
 
-[📈 20일선 돌파 TOP {TOPN}]
-{fmt_lines(rows_breakout)}
+{fmt_group_text(f"📈 20일선 돌파 (업종별, 최대 {TOPN})", breakout_groups)}
 
-[👀 20일선 근접(±{NEAR_PCT*100:.2f}%) TOP {TOPN}]
-{fmt_lines(rows_near)}
+{fmt_group_text(f"👀 20일선 근접 (업종별, ±{NEAR_PCT*100:.2f}%, 최대 {TOPN})", near_groups)}
 
 ※ 본 메일은 한국투자증권(KIS) OpenAPI 기반으로 장 마감 후 자동 생성·발송됩니다.
 """
 
     send_mail(subject, html, text)
-    mailed_count = len(rows_breakout) + len(rows_near)
-    print(f"OK: mailed {mailed_count} rows (breakout={len(rows_breakout)}, near={len(rows_near)})")
+    mailed_count = len(rows_breakout_all) + len(rows_near_all)
+    print(f"OK: mailed {mailed_count} rows (breakout={len(rows_breakout_all)}, near={len(rows_near_all)})")
 
 if __name__ == "__main__":
     main()
