@@ -1,5 +1,5 @@
-# === kis_ma20_close_kr.py (SPLIT SAFE VERSION) ===
-# 전종목 FULL SCAN + GitHub Actions 분할 실행 대응 최종본
+# === kis_ma20_close_kr.py (SPLIT SAFE + KIS REAL TOKEN FIX) ===
+# 전종목 FULL SCAN + GitHub Actions 분할 실행 최종본 (실전 토큰 403 해결)
 
 import os
 import io
@@ -8,20 +8,15 @@ import time
 import requests
 import pandas as pd
 from datetime import timezone, timedelta
-import smtplib
-from email.mime.text import MIMEText
 
 # =========================
-# SPLIT EXECUTION (핵심)
+# SPLIT EXECUTION
 # =========================
 PART_INDEX = int(os.getenv("PART_INDEX", "1"))
 PART_TOTAL = int(os.getenv("PART_TOTAL", "1"))
 
 def split_codes(codes):
-    return [
-        c for i, c in enumerate(codes)
-        if i % PART_TOTAL == (PART_INDEX - 1)
-    ]
+    return [c for i, c in enumerate(codes) if i % PART_TOTAL == (PART_INDEX - 1)]
 
 # =========================
 # ENV / CONST
@@ -31,17 +26,9 @@ KST = timezone(timedelta(hours=9))
 KIS_APPKEY = os.getenv("KIS_APPKEY", "").strip()
 KIS_APPSECRET = os.getenv("KIS_APPSECRET", "").strip()
 KIS_BASE_URL = os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443").strip()
+
 KOSPI_URL = os.getenv("KIS_KOSPI_MST_URL", "").strip()
 KOSDAQ_URL = os.getenv("KIS_KOSDAQ_MST_URL", "").strip()
-
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-SMTP_USER = os.getenv("GMAIL_USER", "").strip()
-SMTP_PASS = os.getenv("GMAIL_APP_PASS", "").strip()
-MAIL_TO_RAW = (os.getenv("HANMAIL_TO") or "").strip()
-
-TG_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-TG_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 TOPN = int(os.getenv("TOPN", "30"))
 VOL_MULT = float(os.getenv("VOL_MULT", "0.7"))
@@ -56,7 +43,6 @@ SLEEP_EVERY = int(os.getenv("SLEEP_EVERY", "25"))
 SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0.35"))
 
 TR_ID_CHART = "FHKST03010100"
-TR_ID_PRICE = "FHKST01010100"
 
 session = requests.Session()
 
@@ -65,8 +51,7 @@ session = requests.Session()
 # =========================
 def must_env():
     miss = []
-    for k in ["KIS_APPKEY","KIS_APPSECRET","KIS_KOSPI_MST_URL","KIS_KOSDAQ_MST_URL",
-              "GMAIL_USER","GMAIL_APP_PASS","HANMAIL_TO"]:
+    for k in ["KIS_APPKEY","KIS_APPSECRET","KIS_KOSPI_MST_URL","KIS_KOSDAQ_MST_URL"]:
         if not os.getenv(k):
             miss.append(k)
     if miss:
@@ -81,11 +66,19 @@ def req(method, url, **kw):
     return r
 
 # =========================
-# KIS
+# KIS (REAL TOKEN – FIXED)
 # =========================
 def kis_token():
-    r = req("POST", f"{KIS_BASE_URL}/oauth2/tokenP",
-            json={"grant_type":"client_credentials","appkey":KIS_APPKEY,"appsecret":KIS_APPSECRET})
+    url = f"{KIS_BASE_URL}/oauth2/tokenP"
+    headers = {
+        "Content-Type": "application/json",
+        "appkey": KIS_APPKEY,
+        "appsecret": KIS_APPSECRET,
+    }
+    body = {"grant_type": "client_credentials"}
+
+    r = requests.post(url, headers=headers, json=body, timeout=REQ_TIMEOUT)
+    r.raise_for_status()
     return r.json()["access_token"]
 
 def load_mst(url):
@@ -106,7 +99,9 @@ def universe():
     return sorted(name_map.keys()), name_map, market
 
 def chart(token, code):
-    r = req("GET", f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+    r = req(
+        "GET",
+        f"{KIS_BASE_URL}/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
         headers={
             "authorization": f"Bearer {token}",
             "appkey": KIS_APPKEY,
@@ -114,11 +109,12 @@ def chart(token, code):
             "tr_id": TR_ID_CHART,
         },
         params={
-            "FID_COND_MRKT_DIV_CODE":"J",
-            "FID_INPUT_ISCD":code,
-            "FID_PERIOD_DIV_CODE":"D",
-            "FID_ORG_ADJ_PRC":"0",
-        })
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": code,
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "0",
+        },
+    )
     return r.json()
 
 # =========================
@@ -159,7 +155,7 @@ def signal(df):
 # =========================
 def main():
     must_env()
-    token=kis_token()
+    token = kis_token()
 
     codes, name_map, market = universe()
     my_codes = split_codes(codes)
