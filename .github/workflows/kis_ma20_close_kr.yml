@@ -21,7 +21,6 @@ jobs:
       # ✅ 기존 kis_ma20_close_kr.py가 쓰는 ENV 이름 그대로 맞춤
       KIS_APPKEY: ${{ secrets.KIS_APPKEY }}
       KIS_APPSECRET: ${{ secrets.KIS_APPSECRET }}
-      KIS_BASE_URL: ${{ secrets.KIS_BASE_URL }}
       KIS_KOSPI_MST_URL: ${{ secrets.KIS_KOSPI_MST_URL }}
       KIS_KOSDAQ_MST_URL: ${{ secrets.KIS_KOSDAQ_MST_URL }}
 
